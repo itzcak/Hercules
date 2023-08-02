@@ -1,0 +1,4490 @@
+diff --git a/quic/core/congestion_control/bbr2_sender.cc b/quic/core/congestion_control/bbr2_sender.cc
+index 3f1c4496..07444f52 100644
+--- a/quic/core/congestion_control/bbr2_sender.cc
++++ b/quic/core/congestion_control/bbr2_sender.cc
+@@ -92,6 +92,7 @@ Bbr2Sender::Bbr2Sender(QuicTime now,
+                 << ", PacingRate:" << pacing_rate_ << ", Cwnd:" << cwnd_
+                 << ", CwndLimits:" << cwnd_limits() << "  @ " << now;
+   QUICHE_DCHECK_EQ(mode_, Bbr2Mode::STARTUP);
++  std::cout << "Starting congestion control: BBR V2" << '\n';
+ }
+ 
+ void Bbr2Sender::SetFromConfig(const QuicConfig& config,
+diff --git a/quic/core/congestion_control/bbr_sender.cc b/quic/core/congestion_control/bbr_sender.cc
+index ba7a3571..384e1901 100644
+--- a/quic/core/congestion_control/bbr_sender.cc
++++ b/quic/core/congestion_control/bbr_sender.cc
+@@ -133,6 +133,7 @@ BbrSender::BbrSender(QuicTime now,
+   }
+   EnterStartupMode(now);
+   set_high_cwnd_gain(kDerivedHighCWNDGain);
++  std::cout << "Starting congestion control: BBR V1" << '\n';
+ }
+ 
+ BbrSender::~BbrSender() {}
+diff --git a/quic/core/congestion_control/pacing_sender.cc b/quic/core/congestion_control/pacing_sender.cc
+index e4b6534e..88540364 100644
+--- a/quic/core/congestion_control/pacing_sender.cc
++++ b/quic/core/congestion_control/pacing_sender.cc
+@@ -66,14 +66,14 @@ void PacingSender::OnPacketSent(
+     return;
+   }
+   // If in recovery, the connection is not coming out of quiescence.
+-  if (bytes_in_flight == 0 && !sender_->InRecovery()) {
++  /*if (bytes_in_flight == 0 && !sender_->InRecovery()) { Itzcak 24/11/2022 Enable pacing of low rate
+     // Add more burst tokens anytime the connection is leaving quiescence, but
+     // limit it to the equivalent of a single bulk write, not exceeding the
+     // current CWND in packets.
+     burst_tokens_ = std::min(
+         initial_burst_size_,
+         static_cast<uint32_t>(sender_->GetCongestionWindow() / kDefaultTCPMSS));
+-  }
++  }*/
+   if (burst_tokens_ > 0) {
+     --burst_tokens_;
+     if (!GetQuicReloadableFlag(quic_donot_reset_ideal_next_packet_send_time)) {
+@@ -144,7 +144,8 @@ QuicTime::Delta PacingSender::TimeUntilSend(
+     return QuicTime::Delta::Infinite();
+   }
+ 
+-  if (burst_tokens_ > 0 || bytes_in_flight == 0 || lumpy_tokens_ > 0) {
++//  if (burst_tokens_ > 0 || bytes_in_flight == 0 || lumpy_tokens_ > 0) { Itzcak 24/11/2022 enable low traffic pacing
++  if (burst_tokens_ > 0 || /*bytes_in_flight == 0 ||*/ lumpy_tokens_ > 0) {
+     // Don't pace if we have burst tokens available or leaving quiescence.
+     QUIC_DVLOG(1) << "Sending packet now. burst_tokens:" << burst_tokens_
+                   << ", bytes_in_flight:" << bytes_in_flight
+diff --git a/quic/core/congestion_control/pcc_monitor_interval_queue.cc b/quic/core/congestion_control/pcc_monitor_interval_queue.cc
+new file mode 100644
+index 00000000..1f2ff8c5
+--- /dev/null
++++ b/quic/core/congestion_control/pcc_monitor_interval_queue.cc
+@@ -0,0 +1,348 @@
++#include "quic/core/congestion_control/pcc_monitor_interval_queue.h"
++
++#include <assert.h>
++#include <iostream>
++
++namespace quic {
++
++namespace {
++// Minimum number of reliable RTT samples per monitor interval.
++const size_t kMinReliableRttLow = 4;
++const size_t kMinReliableRttHigh = 12;
++const size_t kMinRaliableRttUseLow = 100;
++}
++
++PacketRttSample::PacketRttSample()
++    : packet_number(0),
++      sample_rtt(QuicTime::Delta::Zero()),
++      ack_timestamp(QuicTime::Zero()),
++      is_reliable(false),
++      is_reliable_for_gradient_calculation(false) {}
++
++PacketRttSample::PacketRttSample(QuicPacketNumber packet_number,
++                                 QuicTime::Delta rtt,
++                                 QuicTime ack_timestamp,
++                                 bool reliability,
++                                 bool gradient_reliability)
++    : packet_number(packet_number),
++      sample_rtt(rtt),
++      ack_timestamp(ack_timestamp),
++      is_reliable(reliability),
++      is_reliable_for_gradient_calculation(gradient_reliability) {}
++
++LostPacketSample::LostPacketSample() : packet_number(0), bytes(0) {}
++
++LostPacketSample::LostPacketSample(
++    QuicPacketNumber packet_number,
++    QuicByteCount bytes) : packet_number(packet_number),
++                           bytes(bytes) {}
++
++MonitorInterval::MonitorInterval()
++    : sending_rate(QuicBandwidth::Zero()),
++      is_useful(false),
++      rtt_fluctuation_tolerance_ratio(0.0),
++      first_packet_sent_time(QuicTime::Zero()),
++      last_packet_sent_time(QuicTime::Zero()),
++      first_ack_time(QuicTime::Zero()),
++      last_ack_time(QuicTime::Zero()),
++      first_packet_number(0),
++      last_packet_number(0),
++      bytes_sent(0),
++      bytes_acked(0),
++      bytes_lost(0),
++      rtt_on_monitor_start(QuicTime::Delta::Zero()),
++      rtt_on_monitor_end(QuicTime::Delta::Zero()),
++      min_rtt(QuicTime::Delta::Zero()),
++      num_reliable_rtt(0),
++      num_reliable_rtt_for_gradient_calculation(0),
++      has_enough_reliable_rtt(false),
++      is_monitor_duration_extended(false),
++      is_increase(false),
++      do_rttdev_dec(false),
++      base_ack_time(QuicTime::Zero()) {}
++
++MonitorInterval::MonitorInterval(QuicBandwidth sending_rate,
++                                 bool is_useful,
++                                 float rtt_fluctuation_tolerance_ratio,
++                                 QuicTime::Delta rtt,
++				 bool is_increase)
++    : sending_rate(sending_rate),
++      is_useful(is_useful),
++      rtt_fluctuation_tolerance_ratio(rtt_fluctuation_tolerance_ratio),
++      first_packet_sent_time(QuicTime::Zero()),
++      last_packet_sent_time(QuicTime::Zero()),
++      first_ack_time(QuicTime::Zero()),
++      last_ack_time(QuicTime::Zero()),
++      first_packet_number(0),
++      last_packet_number(0),
++      bytes_sent(0),
++      bytes_acked(0),
++      bytes_lost(0),
++      rtt_on_monitor_start(rtt),
++      rtt_on_monitor_end(rtt),
++      min_rtt(rtt),
++      num_reliable_rtt(0),
++      num_reliable_rtt_for_gradient_calculation(0),
++      has_enough_reliable_rtt(false),
++      is_monitor_duration_extended(false),
++      is_increase(is_increase),
++      do_rttdev_dec(false),
++      base_ack_time(QuicTime::Zero()) {}
++
++PccMonitorIntervalQueue::PccMonitorIntervalQueue(
++    PccMonitorIntervalQueueDelegateInterface* delegate)
++    : pending_rtt_(QuicTime::Delta::Zero()),
++      pending_avg_rtt_(QuicTime::Delta::Zero()),
++      pending_ack_interval_(QuicTime::Delta::Zero()),
++      pending_event_time_(QuicTime::Zero()),
++      burst_flag_(false),
++      avg_interval_ratio_(-1.0),
++      num_useful_intervals_(0),
++      num_available_intervals_(0),
++      delegate_(delegate),
++      last_ack_time_(QuicTime::Zero()) {}
++
++void PccMonitorIntervalQueue::EnqueueNewMonitorInterval(
++    QuicBandwidth sending_rate,
++    bool is_useful,
++    float rtt_fluctuation_tolerance_ratio,
++    QuicTime::Delta rtt,
++    bool is_increase) {
++  if (is_useful) {
++    ++num_useful_intervals_;
++  }
++
++  monitor_intervals_.emplace_back(sending_rate, is_useful,
++                                  rtt_fluctuation_tolerance_ratio, rtt, is_increase);
++}
++
++void PccMonitorIntervalQueue::OnPacketSent(QuicTime sent_time,
++                                           QuicPacketNumber packet_number,
++                                           QuicByteCount bytes,
++                                           QuicTime::Delta sent_interval) {
++  if (monitor_intervals_.empty()) {
++    std::cerr << "OnPacketSent called with empty queue.";
++    return;
++  }
++
++  if (monitor_intervals_.back().bytes_sent == 0) {
++    // This is the first packet of this interval.
++    monitor_intervals_.back().first_packet_sent_time = sent_time;
++    monitor_intervals_.back().first_packet_number = packet_number;
++  }
++
++  monitor_intervals_.back().last_packet_sent_time = sent_time;
++  monitor_intervals_.back().last_packet_number = packet_number;
++  monitor_intervals_.back().bytes_sent += bytes;
++
++  monitor_intervals_.back().packet_sent_intervals.push_back(sent_interval);
++}
++
++void PccMonitorIntervalQueue::OnCongestionEvent(
++    const AckedPacketVector& acked_packets,
++    const LostPacketVector& lost_packets,
++    QuicTime::Delta avg_rtt,
++    QuicTime::Delta latest_rtt,
++    QuicTime::Delta min_rtt,
++    QuicTime event_time,
++    QuicTime::Delta ack_interval) {
++  num_available_intervals_ = 0;
++  if (num_useful_intervals_ == 0) {
++    // Skip all the received packets if no intervals are useful.
++    return;
++  }
++
++  bool has_invalid_utility = false;
++  for (MonitorInterval& interval : monitor_intervals_) {
++    if (!interval.is_useful) {
++      // Skips useless monitor intervals.
++      continue;
++    }
++
++    if (IsUtilityAvailable(interval)) {
++      // Skip intervals with available utilities.
++      ++num_available_intervals_;
++      continue;
++    }
++
++    for (const LostPacket& lost_packet : lost_packets) {
++      if (IntervalContainsPacket(interval, lost_packet.packet_number)) {
++        interval.bytes_lost += lost_packet.bytes_lost;
++        interval.lost_packet_samples.push_back(LostPacketSample(
++            lost_packet.packet_number, lost_packet.bytes_lost));
++      }
++    }
++
++    for (const AckedPacket& acked_packet : pending_acked_packets_) {
++      if (IntervalContainsPacket(interval, acked_packet.packet_number)) {
++        if (interval.bytes_acked == 0) {
++          // This is the RTT before starting sending at interval.sending_rate.
++          interval.rtt_on_monitor_start = pending_avg_rtt_;
++	  interval.first_ack_time = event_time;
++	  interval.base_ack_time = last_ack_time_;
++        }
++        interval.bytes_acked += acked_packet.bytes_acked;
++	interval.last_ack_time = last_ack_time_ = event_time;
++
++        bool is_reliable = false;
++        if (!pending_ack_interval_.IsZero()) {
++          float interval_ratio =
++              static_cast<float>(pending_ack_interval_.ToMicroseconds()) /
++              static_cast<float>(ack_interval.ToMicroseconds());
++          if (interval_ratio < 1.0) {
++            interval_ratio = 1.0 / interval_ratio;
++          }
++          if (avg_interval_ratio_ < 0) {
++            avg_interval_ratio_ = interval_ratio;
++          }
++
++          if (interval_ratio > 50.0 * avg_interval_ratio_) {
++            burst_flag_ = true;
++          } else if (burst_flag_) {
++            if (latest_rtt > pending_rtt_ && pending_rtt_ < pending_avg_rtt_) {
++              burst_flag_ = false;
++            }
++          } else {
++            is_reliable = true;
++            interval.num_reliable_rtt++;
++          }
++
++          avg_interval_ratio_ =
++              avg_interval_ratio_ * 0.9 + interval_ratio * 0.1;
++        }
++
++        bool is_reliable_for_gradient_calculation = false;
++        if (is_reliable) {
++        //if (latest_rtt > pending_rtt_) {
++          is_reliable_for_gradient_calculation = true;
++          interval.num_reliable_rtt_for_gradient_calculation++;
++        }
++
++        interval.packet_rtt_samples.push_back(PacketRttSample(
++            acked_packet.packet_number, pending_rtt_, pending_event_time_,
++            is_reliable, is_reliable_for_gradient_calculation));
++        if (interval.num_reliable_rtt >= kMinReliableRttHigh ||
++		(event_time - interval.first_packet_sent_time >=
++		 QuicTime::Delta::FromMilliseconds(kMinRaliableRttUseLow) &&
++		 interval.num_reliable_rtt >= kMinReliableRttLow)) {
++          interval.has_enough_reliable_rtt = true;
++        }
++      }
++    }
++
++    if (IsUtilityAvailable(interval)) {
++      interval.rtt_on_monitor_end = avg_rtt;
++      interval.min_rtt = min_rtt;
++      has_invalid_utility = HasInvalidUtility(&interval);
++      if (has_invalid_utility) {
++        break;
++      }
++      ++num_available_intervals_;
++      assert(num_available_intervals_ <= num_useful_intervals_);
++    }
++  }
++
++  pending_acked_packets_.clear();
++  for (const AckedPacket & acked_packet : acked_packets) {
++    pending_acked_packets_.push_back(acked_packet);
++  }
++  pending_rtt_ = latest_rtt;
++  pending_avg_rtt_ = avg_rtt;
++  pending_ack_interval_ = ack_interval;
++  pending_event_time_ = event_time;
++
++  if (num_useful_intervals_ > num_available_intervals_ &&
++      !has_invalid_utility) {
++/*      if (LIMITED_PRINT(2, 25)) {
++	  std::cout
++	      << "Useful intervals: " << num_useful_intervals_ << ", Available intervals: "
++	      << num_available_intervals_ << std::endl;
++	  for (MonitorInterval& interval : monitor_intervals_) {
++	      if (!interval.is_useful)
++		  continue;
++	      std:: cout << "reliable_rtt: " << interval.has_enough_reliable_rtt
++	      << ", bytes_acked: " << interval.bytes_acked
++	      << ", bytes_lost: " << interval.bytes_lost << ", bytes_sent: " << interval.bytes_sent << "\n";
++	  }
++      }*/
++     return;
++  }
++
++  if (!has_invalid_utility) {
++    assert(num_useful_intervals_ > 0u);
++
++    std::vector<const MonitorInterval *> useful_intervals;
++    for (const MonitorInterval& interval : monitor_intervals_) {
++      if (!interval.is_useful) {
++        continue;
++      }
++      useful_intervals.push_back(&interval);
++    }
++    assert(num_available_intervals_ == useful_intervals.size());
++
++    delegate_->OnUtilityAvailable(useful_intervals, event_time);
++  }
++
++  // Remove MonitorIntervals from the head of the queue,
++  // until all useful intervals are removed.
++  while (num_useful_intervals_ > 0) {
++    if (monitor_intervals_.front().is_useful) {
++      --num_useful_intervals_;
++    }
++    monitor_intervals_.pop_front();
++  }
++  num_available_intervals_ = 0;
++}
++
++const MonitorInterval& PccMonitorIntervalQueue::front() const {
++  assert(!monitor_intervals_.empty());
++  return monitor_intervals_.front();
++}
++
++const MonitorInterval& PccMonitorIntervalQueue::current() const {
++  assert(!monitor_intervals_.empty());
++  return monitor_intervals_.back();
++}
++
++void PccMonitorIntervalQueue::extend_current_interval() {
++  assert(!monitor_intervals_.empty());
++  monitor_intervals_.back().is_monitor_duration_extended = true;
++}
++
++bool PccMonitorIntervalQueue::empty() const {
++  return monitor_intervals_.empty();
++}
++
++size_t PccMonitorIntervalQueue::size() const {
++  return monitor_intervals_.size();
++}
++
++void PccMonitorIntervalQueue::clear() {
++    OnRttInflationInStarting();
++}
++
++void PccMonitorIntervalQueue::OnRttInflationInStarting() {
++  monitor_intervals_.clear();
++  num_useful_intervals_ = 0;
++  num_available_intervals_ = 0;
++}
++
++bool PccMonitorIntervalQueue::IsUtilityAvailable(
++    const MonitorInterval& interval) const {
++  return (interval.has_enough_reliable_rtt &&
++          interval.bytes_acked + interval.bytes_lost >= interval.bytes_sent - 100); //Work around QUICHE bug which report on slightly more send data
++}
++
++bool PccMonitorIntervalQueue::IntervalContainsPacket(
++    const MonitorInterval& interval,
++    QuicPacketNumber packet_number) const {
++  return (packet_number >= interval.first_packet_number &&
++          packet_number <= interval.last_packet_number);
++}
++
++bool PccMonitorIntervalQueue::HasInvalidUtility(
++    const MonitorInterval* interval) const {
++  return interval->first_packet_sent_time == interval->last_packet_sent_time;
++}
++
++}  // namespace quic
+diff --git a/quic/core/congestion_control/pcc_monitor_interval_queue.h b/quic/core/congestion_control/pcc_monitor_interval_queue.h
+new file mode 100644
+index 00000000..ef085fcc
+--- /dev/null
++++ b/quic/core/congestion_control/pcc_monitor_interval_queue.h
+@@ -0,0 +1,240 @@
++#ifndef THIRD_PARTY_PCC_QUIC_PCC_MONITOR_QUEUE_H_
++#define THIRD_PARTY_PCC_QUIC_PCC_MONITOR_QUEUE_H_
++
++#include <deque>
++#include <utility>
++#include <vector>
++
++#include "quic/core/congestion_control/send_algorithm_interface.h"
++#include "quic/core/quic_time.h"
++#include "quic/core/quic_types.h"
++
++namespace quic {
++
++// PacketRttSample, stores packet number and the corresponding RTT.
++struct PacketRttSample {
++  PacketRttSample();
++  PacketRttSample(QuicPacketNumber packet_number,
++                  QuicTime::Delta rtt,
++                  QuicTime ack_timestamp,
++                  bool reliability,
++                  bool gradient_reliability);
++  ~PacketRttSample() {}
++
++  // Packet number of the sampled packet.
++  QuicPacketNumber packet_number;
++  // RTT corresponding to the sampled packet.
++  QuicTime::Delta sample_rtt;
++  // Timestamp when the ACK of the sampled packet is received.
++  QuicTime ack_timestamp;
++
++  // Flag representing if the RTT sample is reliable for utility calculation.
++  bool is_reliable;
++  bool is_reliable_for_gradient_calculation;
++};
++
++struct LostPacketSample {
++  LostPacketSample();
++  LostPacketSample(QuicPacketNumber packet_number,
++                  QuicByteCount bytes);
++
++  QuicPacketNumber packet_number;
++  QuicByteCount bytes;
++};
++
++// MonitorInterval, as the queue's entry struct, stores the information
++// of a PCC monitor interval (MonitorInterval) that can be used to
++// - pinpoint a acked/lost packet to the corresponding MonitorInterval,
++// - calculate the MonitorInterval's utility value.
++struct MonitorInterval {
++  MonitorInterval();
++  MonitorInterval(QuicBandwidth sending_rate,
++                  bool is_useful,
++                  float rtt_fluctuation_tolerance_ratio,
++                  QuicTime::Delta rtt,
++		  bool is_increase);
++  ~MonitorInterval() {}
++
++  // Sending rate.
++  QuicBandwidth sending_rate;
++  // True if calculating utility for this MonitorInterval.
++  bool is_useful;
++  // The tolerable rtt fluctuation ratio.
++  float rtt_fluctuation_tolerance_ratio;
++
++  // Sent time of the first packet.
++  QuicTime first_packet_sent_time;
++  // Sent time of the last packet.
++  QuicTime last_packet_sent_time;
++  // Sent time of the first packet.
++  QuicTime first_ack_time;
++  // Sent time of the last packet.
++  QuicTime last_ack_time;
++  // PacketNumber of the first sent packet.
++  QuicPacketNumber first_packet_number;
++  // PacketNumber of the last sent packet.
++  QuicPacketNumber last_packet_number;
++
++  // Number of bytes which are sent in total.
++  QuicByteCount bytes_sent;
++  // Number of bytes which have been acked.
++  QuicByteCount bytes_acked;
++  // Number of bytes which are considered as lost.
++  QuicByteCount bytes_lost;
++
++  // Smoothed RTT when the first packet is sent.
++  QuicTime::Delta rtt_on_monitor_start;
++  // RTT when all sent packets are either acked or lost.
++  QuicTime::Delta rtt_on_monitor_end;
++  // Minimum RTT seen by PCC sender.
++  QuicTime::Delta min_rtt;
++
++  // Interval since previous sent packet for each packet in the interval.
++  std::vector<QuicTime::Delta> packet_sent_intervals;
++  // Packet RTT sample for each sent packet in the monitor interval.
++  std::vector<PacketRttSample> packet_rtt_samples;
++  // Lost packet sample for each lost packet in the monitor interval.
++  std::vector<LostPacketSample> lost_packet_samples;
++
++  size_t num_reliable_rtt;
++  size_t num_reliable_rtt_for_gradient_calculation;
++  // True if the interval has enough number of reliable RTT samples.
++  bool has_enough_reliable_rtt;
++
++  // True only if the monitor duration is doubled due to lack of reliable RTTs.
++  bool is_monitor_duration_extended;
++  bool is_increase;
++  bool do_rttdev_dec;
++
++  QuicTime base_ack_time;
++};
++
++// A delegate interface for further processing when all
++// 'useful' MonitorIntervals' utilities are available.
++class PccMonitorIntervalQueueDelegateInterface {
++ public:
++  virtual ~PccMonitorIntervalQueueDelegateInterface() {}
++
++  virtual void OnUtilityAvailable(
++      const std::vector<const MonitorInterval *>& useful_intervals,
++      QuicTime event_time) = 0;
++};
++
++// PccMonitorIntervalQueue contains a queue of MonitorIntervals.
++// New MonitorIntervals are added to the tail of the queue.
++// Existing MonitorIntervals are removed from the queue when all
++// 'useful' intervals' utilities are available.
++class PccMonitorIntervalQueue {
++ public:
++  explicit PccMonitorIntervalQueue(
++      PccMonitorIntervalQueueDelegateInterface* delegate);
++  PccMonitorIntervalQueue(const PccMonitorIntervalQueue&) = delete;
++  PccMonitorIntervalQueue& operator=(const PccMonitorIntervalQueue&) = delete;
++  PccMonitorIntervalQueue(PccMonitorIntervalQueue&&) = delete;
++  PccMonitorIntervalQueue& operator=(PccMonitorIntervalQueue&&) = delete;
++  ~PccMonitorIntervalQueue() {}
++
++  // Creates a new MonitorInterval and add it to the tail of the
++  // monitor interval queue, provided the necessary variables
++  // for MonitorInterval initialization.
++  void EnqueueNewMonitorInterval(QuicBandwidth sending_rate,
++                                 bool is_useful,
++                                 float rtt_fluctuation_tolerance_ratio,
++                                 QuicTime::Delta rtt,
++				 bool is_increase);
++
++  // Called when a packet belonging to current monitor interval is sent.
++  void OnPacketSent(QuicTime sent_time,
++                    QuicPacketNumber packet_number,
++                    QuicByteCount bytes,
++                    QuicTime::Delta sent_interval);
++
++  // Called when packets are acked or considered as lost.
++  void OnCongestionEvent(const AckedPacketVector& acked_packets,
++                         const LostPacketVector& lost_packets,
++                         QuicTime::Delta avg_rtt,
++                         QuicTime::Delta latest_rtt,
++                         QuicTime::Delta min_rtt,
++                         QuicTime event_time,
++                         QuicTime::Delta ack_interval);
++
++  // Called when RTT inflation ratio is greater than
++  // max_rtt_fluctuation_tolerance_ratio_in_starting.
++  void OnRttInflationInStarting();
++
++  // Returns the fisrt MonitorInterval in the front of the queue. The caller
++  // needs to make sure the queue is not empty before calling this function.
++  const MonitorInterval& front() const;
++  // Returns the most recent MonitorInterval in the tail of the queue. The
++  // caller needs to make sure the queue is not empty before calling this
++  // function.
++  const MonitorInterval& current() const;
++  void RemoveCurrent() {if (!empty()) monitor_intervals_.pop_back(); }
++  // Mark the most recent MonitorInterval as already extended.
++  void extend_current_interval();
++  size_t num_useful_intervals() const { return num_useful_intervals_; }
++  size_t num_available_intervals() const { return num_available_intervals_; }
++  bool empty() const;
++  size_t size() const;
++  void clear();
++
++ private:
++  // Returns true if the utility of |interval| is available, i.e.,
++  // when all the interval's packets are either acked or lost.
++  bool IsUtilityAvailable(const MonitorInterval& interval) const;
++
++  // Retruns true if |packet_number| belongs to |interval|.
++  bool IntervalContainsPacket(const MonitorInterval& interval,
++                              QuicPacketNumber packet_number) const;
++
++  // Returns true if the utility of |interval| is invalid, i.e., if it only
++  // contains a single sent packet.
++  bool HasInvalidUtility(const MonitorInterval* interval) const;
++
++  std::deque<MonitorInterval> monitor_intervals_;
++  // Vector of acked packets with pending RTT reliability.
++  std::vector<AckedPacket> pending_acked_packets_;
++  // Latest RTT corresponding to pending acked packets.
++  QuicTime::Delta pending_rtt_;
++  // Average RTT corresponding to pending acked packets.
++  QuicTime::Delta pending_avg_rtt_;
++  // ACK interval corresponding to pending acked packets.
++  QuicTime::Delta pending_ack_interval_;
++  // ACK reception time corresponding to pending acked packets.
++  QuicTime pending_event_time_;
++
++  bool burst_flag_;
++
++  // EWMA of ratio between two consecutive ACK intervals, i.e., interval between
++  // reception time of two consecutive ACKs.
++  float avg_interval_ratio_;
++
++  // Number of useful intervals in the queue.
++  size_t num_useful_intervals_;
++  // Number of useful intervals in the queue with available utilities.
++  size_t num_available_intervals_;
++  // Delegate interface, not owned.
++  PccMonitorIntervalQueueDelegateInterface* delegate_;
++  QuicTime last_ack_time_;
++};
++
++extern QuicTime CurTime__;
++#define LIMITED_PRINT(secs, prints)\
++({\
++    static QuicTime LastPrintTime = QuicTime::Zero();\
++    static int printed = 0;\
++    bool ret = false;\
++    if (LastPrintTime + QuicTime::Delta::FromSeconds(secs) <= CurTime__ || printed >= (prints)){\
++	printed = 0;\
++	LastPrintTime = CurTime__;\
++	ret = true;\
++    }\
++    ret;\
++})
++
++#define BW_MAX_LIMIT 1.5
++//#define DEBUG_PRINTS
++
++}  // namespace quic
++
++#endif  // THIRD_PARTY_PCC_QUIC_PCC_MONITOR_QUEUE_H_
+diff --git a/quic/core/congestion_control/pcc_sender.cc b/quic/core/congestion_control/pcc_sender.cc
+new file mode 100644
+index 00000000..29af81a2
+--- /dev/null
++++ b/quic/core/congestion_control/pcc_sender.cc
+@@ -0,0 +1,742 @@
++#include "quic/core/congestion_control/pcc_sender.h"
++#include "quic/core/congestion_control/rtt_stats.h"
++#include "quic/core/quic_time.h"
++
++#include <assert.h>
++#include <iostream>
++
++#include <algorithm>
++
++//#include "base/commandlineflags.h"
++//#include "third_party/quic/core/congestion_control/rtt_stats.h"
++//#include "third_party/quic/core/quic_time.h"
++//#include "third_party/quic/platform/api/quic_str_cat.h"
++
++static bool FLAGS_trigger_early_termination_based_on_interval_queue_front =  false;
++static bool FLAGS_enable_early_termination_based_on_latest_rtt_trend =  false;
++static double FLAGS_max_rtt_fluctuation_tolerance_ratio_in_starting = 0.5;
++static double FLAGS_max_rtt_fluctuation_tolerance_ratio_in_decision_made =  0.2;
++static bool FLAGS_can_send_respect_congestion_window =  true;
++static double FLAGS_bytes_in_flight_gain =  1.5;
++static bool FLAGS_exit_starting_based_on_sampled_bandwidth =  false;
++static bool FLAGS_restore_central_rate_upon_app_limited =  false;
++namespace quic {
++
++const size_t kNumIntervalGroupsInProbingScavenger = 2;
++const size_t kNumIntervalGroupsInProbingPrimary = 3;
++
++const QuicTime::Delta kInitialRtt = QuicTime::Delta::FromMicroseconds(100000);
++//const QuicByteCount kDefaultTCPMSS = 1400;
++// Number of bits per Mbit.
++const size_t kMegabit = 1024 * 1024;
++// Minimum number of packets per monitor interval.
++// const size_t kMinPacketPerInterval = 5;
++// Step size for rate change in PROBING mode.
++const float kProbingStepSize = 0.05f;
++// Base percentile step size for rate change in DECISION_MADE mode.
++const float kDecisionMadeStepSize = 0.02f;
++// Maximum percentile step size for rate change in DECISION_MADE mode.
++const float kMaxDecisionMadeStepSize = 0.10f;
++// Bandwidth filter window size in round trips.
++// const QuicRoundTripCount kBandwidthWindowSize = 6;
++// The factor that converts utility gradient to sending rate change.
++// float kUtilityGradientToRateChangeFactor = 1.0f;
++// The exponent to amplify sending rate change based on number of consecutive
++// rounds in DECISION_MADE mode.
++// float kRateChangeAmplifyExponent = 1.2f;
++QuicTime CurTime__ = QuicTime::Zero();
++
++// The minimum ratio of RTT samples being reliable per MI.
++const float kMinReliabilityRatio = 0.8f;
++
++UtilityInfo::UtilityInfo()
++    : sending_rate(QuicBandwidth::Zero()), utility(0.0) {}
++
++UtilityInfo::UtilityInfo(QuicBandwidth rate, float utility)
++    : sending_rate(rate), utility(utility) {}
++
++/*
++PccSender::DebugState::DebugState(const PccSender& sender)
++    : mode(sender.mode_),
++      sending_rate(sender.interval_queue_.current().sending_rate),
++      latest_rtt(sender.latest_rtt_),
++      smoothed_rtt(sender.avg_rtt_),
++      rtt_dev(sender.rtt_deviation_),
++      is_useful(sender.interval_queue_.current().is_useful),
++      first_packet_sent_time(sender.interval_queue_.current()
++                                 .first_packet_sent_time),
++      last_packet_sent_time(sender.interval_queue_.current()
++                                 .last_packet_sent_time),
++      first_packet_number(sender.interval_queue_.current().first_packet_number),
++      last_packet_number(sender.interval_queue_.current().last_packet_number),
++      bytes_sent(sender.interval_queue_.current().bytes_sent),
++      bytes_acked(sender.interval_queue_.current().bytes_acked),
++      bytes_lost(sender.interval_queue_.current().bytes_lost),
++      rtt_on_monitor_start(sender.interval_queue_.current()
++                                  .rtt_on_monitor_start),
++      rtt_on_monitor_end(sender.interval_queue_.current().rtt_on_monitor_end),
++      latest_utility(sender.latest_utility_),
++      bandwidth(sender.BandwidthEstimate()) {}
++*/
++
++std::string PccSender::GetDebugState() const {
++  /*if (interval_queue_.empty()) {
++    return "pcc??";
++  }
++
++  const MonitorInterval& mi = interval_queue_.current();
++  std::ostringstream oss;
++  oss << "[st=" << mode_ << "," << "r=" << sending_rate_.ToKBitsPerSecond() << ",";
++  oss << "pu=" << latest_utility_info_.utility << ",";
++  oss << "dir=" << change_dir_ << "," << "round=" << rounds_ << ",";
++  oss << "num=" << interval_queue_.num_useful_intervals() << "]";
++  oss << "[r=" << mi.sending_rate.ToKBitsPerSecond() << "," << "use=" << mi.is_useful << ",";
++  oss << "(" << mi.first_packet_sent_time.ToDebuggingValue() << "-" << ">";
++  oss << mi.last_packet_sent_time.ToDebuggingValue() << ")" << "(";
++  oss << mi.first_packet_number << "-" << ">" << mi.last_packet_number << ")" << "(";
++  oss << mi.bytes_sent << "/" << mi.bytes_acked << "/" << mi.bytes_lost << ")" << "(";
++  oss << mi.rtt_on_monitor_start_us << "-" << ">" << mi.rtt_on_monitor_end_us << ")";
++
++  return oss.str();*/
++  return ""; //TODO: fix above code
++}
++
++PccSender::PccSender(const RttStats* rtt_stats,
++                     QuicPacketCount initial_congestion_window,
++                     QuicPacketCount max_congestion_window,
++                      QuicRandom* random)
++    : mode_(STARTING),
++      sending_rate_(
++          QuicBandwidth::FromBytesAndTimeDelta(initial_congestion_window *
++                                                   kDefaultTCPMSS,
++                                               kInitialRtt)),
++      prev_sending_rate_(QuicBandwidth::Zero()),
++      has_seen_valid_rtt_(false),
++      latest_utility_(0.0),
++      conn_start_time_(QuicTime::Zero()),
++      monitor_duration_(QuicTime::Delta::Zero()),
++      direction_(INCREASE),
++      rounds_(1),
++      interval_queue_(/*delegate=*/this),
++      rtt_on_inflation_start_(QuicTime::Delta::Zero()),
++      max_cwnd_bytes_(max_congestion_window * kDefaultTCPMSS),
++      rtt_deviation_(QuicTime::Delta::Zero()),
++      min_rtt_deviation_(QuicTime::Delta::Zero()),
++      latest_rtt_(QuicTime::Delta::Zero()),
++      min_rtt_(QuicTime::Delta::Zero()),
++      avg_rtt_(QuicTime::Delta::Zero()),
++      // unacked_packets_(unacked_packets),
++      rtt_stats_(rtt_stats),
++      random_(random),
++      exit_starting_based_on_sampled_bandwidth_(
++          FLAGS_exit_starting_based_on_sampled_bandwidth),
++      latest_sent_timestamp_(QuicTime::Zero()),
++      latest_ack_timestamp_(QuicTime::Zero()),
++      max_bw_(QuicBandwidth::FromBitsPerSecond(
++		  static_cast<int64_t>(PccUtilityManager::GetHerculesMaxBw()) * 106 / 100)), //Add extra 6% for headers
++      min_bw_(QuicBandwidth::FromBitsPerSecond(
++		  static_cast<int64_t>(PccUtilityManager::GetHerculesMinBw()) * 106 / 100)), //Add extra 6% for headers
++      max_bw_valid_(max_bw_.ToBitsPerSecond() > 0),
++      min_bw_valid_(min_bw_.ToBitsPerSecond() > 0) {
++#ifdef DEBUG_PRINTS
++	  std::cout << "Starting congestion control: PCC" << std::endl;
++#endif
++}
++
++#define MIN_MI_MS 20
++void PccSender::OnPacketSent(QuicTime sent_time,
++                             QuicByteCount bytes_in_flight,
++                             QuicPacketNumber packet_number,
++                             QuicByteCount bytes,
++                             HasRetransmittableData is_retransmittable) {
++  if (!conn_start_time_.IsInitialized()) {
++    conn_start_time_ = sent_time;
++    latest_sent_timestamp_ = sent_time;
++  }
++
++  CurTime__ = sent_time;
++
++  if (CreateNewInterval(sent_time)) {
++    //Work around for latency as result of high CPU
++    float mi_len = max_bw_.ToBitsPerSecond() > static_cast<int64_t>(kMegabit * 100)? 1.0: 1.5;
++    QuicTime::Delta mi_base = min_rtt_.ToMilliseconds() >= MIN_MI_MS ? min_rtt_ : QuicTime::Delta::FromMilliseconds(MIN_MI_MS);
++//    std::cout << "Create new interval\n";
++    MaybeSetSendingRate();
++    // Set the monitor duration to 1.0 of min rtt.
++    monitor_duration_ = mi_base * mi_len;
++
++    bool is_useful = CreateUsefulInterval();
++    interval_queue_.EnqueueNewMonitorInterval(
++        is_useful ? sending_rate_ : GetSendingRateForNonUsefulInterval(),
++        is_useful, GetMaxRttFluctuationTolerance(), rtt_stats_->smoothed_rtt(),
++	direction_ == INCREASE || mode_ == STARTING);
++#ifdef DEBUG_PRINTS
++    std::cerr << (sent_time - QuicTime::Zero()).ToMicroseconds() << " "
++              << "Create MI (useful: " << interval_queue_.current().is_useful
++              << ") with rate " << interval_queue_.current().sending_rate
++                                                            .ToKBitsPerSecond()
++              << ", duration " << monitor_duration_.ToMicroseconds()
++              << std::endl;
++#endif
++  } else //Start measure from first send with new configuration
++	interval_queue_.OnPacketSent(sent_time, packet_number, bytes,
++                               sent_time - latest_sent_timestamp_);
++  latest_sent_timestamp_ = sent_time;
++
++}
++
++void PccSender::UpdateRtt(QuicTime event_time, QuicTime::Delta rtt) {
++  latest_rtt_ = rtt;
++  rtt_deviation_ = rtt_deviation_.IsZero()
++      ? QuicTime::Delta::FromMicroseconds(rtt.ToMicroseconds() / 2)
++      : QuicTime::Delta::FromMicroseconds(static_cast<int64_t>(
++            0.75 * rtt_deviation_.ToMicroseconds() +
++            0.25 * std::abs((avg_rtt_ - rtt).ToMicroseconds())));
++  if (min_rtt_deviation_.IsZero() || rtt_deviation_ < min_rtt_deviation_) {
++    min_rtt_deviation_ = rtt_deviation_;
++  }
++
++  avg_rtt_ = avg_rtt_.IsZero() ? rtt : avg_rtt_ * 0.875 + rtt * 0.125;
++  if (min_rtt_.IsZero() || rtt < min_rtt_) {
++    min_rtt_ = rtt;
++  }
++  //std::cerr << (event_time - QuicTime::Zero()).ToMicroseconds() << " New RTT "
++  //          << rtt.ToMicroseconds() << std::endl;
++
++  latest_ack_timestamp_ = event_time;
++}
++
++void PccSender::OnCongestionEvent(bool rtt_updated,
++                                  QuicByteCount bytes_in_flight,
++                                  QuicTime event_time,
++                                  const AckedPacketVector& acked_packets,
++                                  const LostPacketVector& lost_packets) {
++  if (!latest_ack_timestamp_.IsInitialized()) {
++    latest_ack_timestamp_ = event_time;
++  }
++
++  CurTime__ = event_time;
++  QuicTime::Delta ack_interval = QuicTime::Delta::Zero();
++  if (rtt_updated) {
++    ack_interval = event_time - latest_ack_timestamp_;
++    UpdateRtt(event_time, rtt_stats_->latest_rtt());
++  }
++  QuicTime::Delta avg_rtt = avg_rtt_;
++  if (!has_seen_valid_rtt_) {
++    has_seen_valid_rtt_ = true;
++    // Update sending rate if the actual RTT is smaller than initial rtt value
++    // in RttStats, so PCC can start with larger rate and ramp up faster.
++/*    if (latest_rtt_ < kInitialRtt) {
++      sending_rate_ = sending_rate_ *
++          (static_cast<float>(kInitialRtt.ToMicroseconds()) /
++           static_cast<float>(latest_rtt_.ToMicroseconds()));
++    }*/
++  }
++  if (mode_ == STARTING && CheckForRttInflation()) {
++    // Directly enter PROBING when rtt inflation already exceeds the tolerance
++    // ratio, so as to reduce packet losses and mitigate rtt inflation.
++    std::cerr << "RTT inflation detected, switch from STARTING mode to PROBING mode\n";
++    interval_queue_.OnRttInflationInStarting();
++    EnterProbing();
++    return;
++  }
++
++  interval_queue_.OnCongestionEvent(acked_packets, lost_packets, avg_rtt,
++                                    latest_rtt_, min_rtt_, event_time,
++                                    ack_interval);
++}
++
++size_t PccSender::GetNumIntervalGroupsInProbing() const {
++  if (utility_manager_.GetEffectiveUtilityTag() == "Scavenger"
++	  || utility_manager_.GetEffectiveUtilityTag() == "Hercules") {
++    return kNumIntervalGroupsInProbingScavenger;
++  } else {
++    return kNumIntervalGroupsInProbingPrimary;
++  }
++}
++
++void PccSender::SetUtilityTag(std::string utility_tag) {
++  utility_manager_.SetUtilityTag(utility_tag);
++}
++
++void PccSender::SetUtilityParameter(void* param) {
++  utility_manager_.SetUtilityParameter(param);
++}
++
++bool PccSender::CanSend(QuicByteCount bytes_in_flight) {
++  if (!FLAGS_can_send_respect_congestion_window) {
++    return true;
++  }
++
++  return bytes_in_flight < FLAGS_bytes_in_flight_gain * GetCongestionWindow();
++}
++
++QuicBandwidth PccSender::PacingRate(QuicByteCount bytes_in_flight) const {
++  return interval_queue_.empty() ? sending_rate_
++                                 : interval_queue_.current().sending_rate;
++}
++
++QuicBandwidth PccSender::BandwidthEstimate() const {
++  return PacingRate(0);
++}
++
++QuicByteCount PccSender::GetCongestionWindow() const {
++  // Use min rtt to calculate expected congestion window except when it equals
++  // 0, which happens when the connection just starts.
++  return sending_rate_ * (min_rtt_.IsZero()
++                              ? kInitialRtt
++                              : min_rtt_) * 3 / 2;
++}
++
++bool PccSender::InSlowStart() const { return mode_ == STARTING; }
++
++bool PccSender::InRecovery() const { return false; }
++
++
++QuicByteCount PccSender::GetSlowStartThreshold() const { return 0; }
++
++CongestionControlType PccSender::GetCongestionControlType() const {
++   if (utility_manager_.GetUtilityTag() == "Vivace")
++       return kPccVV;
++   else
++       return kPCC;
++}
++
++void PccSender::OnApplicationLimited(QuicByteCount bytes_in_flight) {
++    // Stop intervals on idle send
++//	interval_queue_.clear();
++}
++/*
++PccSender::DebugState PccSender::ExportDebugState() const {
++  return DebugState(*this);
++}*/
++
++void PccSender::OnUtilityAvailable(
++    const std::vector<const MonitorInterval *>& useful_intervals,
++    QuicTime event_time) {
++  // Calculate the utilities for all available intervals.
++  std::vector<UtilityInfo> utility_info;
++  for(size_t i = 0; i < useful_intervals.size(); ++i) {
++    double utility = utility_manager_.CalculateUtility(useful_intervals[i], event_time - conn_start_time_);
++    utility_info.push_back( UtilityInfo(useful_intervals[i]->sending_rate, utility));
++/*    std::cerr << "End MI (rate: "
++              << useful_intervals[i]->sending_rate.ToKBitsPerSecond()
++              << ", rtt "
++              << useful_intervals[i]->rtt_on_monitor_start.ToMicroseconds()
++              << "->"
++              << useful_intervals[i]->rtt_on_monitor_end.ToMicroseconds()
++              << ", " << useful_intervals[i]->rtt_fluctuation_tolerance_ratio
++              << ", " << useful_intervals[i]->bytes_acked << "/"
++              << useful_intervals[i]->bytes_sent << ") with utility "
++              << utility
++              << " (latest " << latest_utility_ << ")" << std::endl;*/
++  }
++
++  switch (mode_) {
++    case STARTING:
++      assert(utility_info.size() == 1u);
++      if (utility_info[0].utility > latest_utility_) {
++        // Stay in STARTING mode. Double the sending rate and update
++        // latest_utility.
++	prev_sending_rate_ = sending_rate_;
++        sending_rate_ = sending_rate_ * 2;
++        latest_utility_ = utility_info[0].utility;
++        ++rounds_;
++      } else {
++        // Enter PROBING mode if utility decreases.
++        EnterProbing();
++      }
++      break;
++    case PROBING:
++      if (CanMakeDecision(utility_info)) {
++        if (FLAGS_restore_central_rate_upon_app_limited &&
++            interval_queue_.current().is_useful) {
++          // If there is no non-useful interval in this round of PROBING, sender
++          // needs to change sending_rate_ back to central rate.
++          RestoreCentralSendingRate();
++        }
++        assert(utility_info.size() == 2 * GetNumIntervalGroupsInProbing());
++        // Enter DECISION_MADE mode if a decision is made.
++        direction_ = (utility_info[0].utility > utility_info[1].utility)
++                         ? ((utility_info[0].sending_rate >
++                             utility_info[1].sending_rate)
++                                ? INCREASE
++                                : DECREASE)
++                         : ((utility_info[0].sending_rate >
++                             utility_info[1].sending_rate)
++                                ? DECREASE
++                                : INCREASE);
++        latest_utility_ = std::max(
++            utility_info[2 * GetNumIntervalGroupsInProbing() - 2].utility,
++            utility_info[2 * GetNumIntervalGroupsInProbing() - 1].utility);
++        EnterDecisionMade();
++      } else {
++        // Stays in PROBING mode.
++        EnterProbing();
++      }
++      break;
++    case DECISION_MADE:
++      assert(utility_info.size() == 1u);
++      if (utility_info[0].utility > latest_utility_) {
++        // Remain in DECISION_MADE mode. Keep increasing or decreasing the
++        // sending rate.
++        ++rounds_;
++        if (direction_ == INCREASE) {
++          sending_rate_ = sending_rate_ *
++                          (1 + std::min(rounds_ * kDecisionMadeStepSize,
++                                        kMaxDecisionMadeStepSize));
++        } else {
++          sending_rate_ = sending_rate_ *
++                          (1 - std::min(rounds_ * kDecisionMadeStepSize,
++                                        kMaxDecisionMadeStepSize));
++        }
++        latest_utility_ = utility_info[0].utility;
++      } else {
++        // Enter PROBING mode if utility decreases.
++        EnterProbing();
++      }
++      break;
++  }
++}
++
++bool PccSender::CreateNewInterval(QuicTime event_time) {
++  // Start a new monitor interval upon an empty interval queue.
++  if (interval_queue_.empty()) {
++    return true;
++  }
++
++  // Do not start new monitor interval before latest RTT is available.
++  if (latest_rtt_.IsZero()) {
++/*    if (LIMITED_PRINT(2, 25))
++	std::cout << "CreateNewInterval return false 1\n";*/
++    return false;
++  }
++
++  // Start a (useful) interval if latest RTT is available but the queue does not
++  // contain useful interval.
++  if (interval_queue_.num_useful_intervals() == 0) {
++    return true;
++  }
++
++  const MonitorInterval& current_interval = interval_queue_.current();
++  // Do not start new interval if there is non-useful interval in the tail.
++  if (!current_interval.is_useful) {
++/*    if (LIMITED_PRINT(2, 25))
++	std::cout << "CreateNewInterval return false 2\n";*/
++    return false;
++  }
++
++  // Do not start new interval until current useful interval has enough reliable
++  // RTT samples, and its duration exceeds the monitor_duration_.
++  if (!current_interval.has_enough_reliable_rtt ||
++      event_time - current_interval.first_packet_sent_time <
++          monitor_duration_) {
++/*    if (LIMITED_PRINT(2, 25))
++	std::cout << "CreateNewInterval return false 3\n";*/
++    return false;
++  }
++
++  if (static_cast<float>(current_interval.num_reliable_rtt) /
++      static_cast<float>(current_interval.packet_rtt_samples.size()) >
++          kMinReliabilityRatio) {
++    // Start a new interval if current useful interval has an RTT reliability
++    // ratio larger than kMinReliabilityRatio.
++    return true;
++  } else if (current_interval.is_monitor_duration_extended) {
++    // Start a new interval if current useful interval has been extended once.
++    return true;
++  } else {
++    // Extend the monitor duration if the current useful interval has not been
++    // extended yet, and its RTT reliability ratio is lower than
++    // kMinReliabilityRatio.
++    monitor_duration_ = monitor_duration_ * 2.0;
++    interval_queue_.extend_current_interval();
++  /*  if (LIMITED_PRINT(2, 25))
++	std::cout << "CreateNewInterval return false 4\n";*/
++    return false;
++  }
++}
++
++bool PccSender::CreateUsefulInterval() const {
++  if (avg_rtt_.ToMicroseconds() == 0) {
++    // Create non useful intervals upon starting a connection, until there is
++    // valid rtt stats.
++    assert(mode_ == STARTING);
++    return false;
++  }
++  // In STARTING and DECISION_MADE mode, there should be at most one useful
++  // intervals in the queue; while in PROBING mode, there should be at most
++  // 2 * GetNumIntervalGroupsInProbing().
++  size_t max_num_useful =
++      (mode_ == PROBING) ? 2 * GetNumIntervalGroupsInProbing() : 1;
++  return interval_queue_.num_useful_intervals() < max_num_useful;
++}
++
++QuicBandwidth PccSender::GetSendingRateForNonUsefulInterval() const {
++  switch (mode_) {
++    case STARTING:
++      // Use halved sending rate for non-useful intervals in STARTING.
++      return sending_rate_ * 0.5;
++    case PROBING:
++      // Use the smaller probing rate in PROBING.
++      return sending_rate_ * (1 - kProbingStepSize);
++    case DECISION_MADE:
++      // Use the last (smaller) sending rate if the sender is increasing sending
++      // rate in DECISION_MADE. Otherwise, use the current sending rate.
++      return direction_ == DECREASE
++          ? sending_rate_
++          : sending_rate_ *
++                (1.0 / (1 + std::min(rounds_ * kDecisionMadeStepSize,
++                                     kMaxDecisionMadeStepSize)));
++  }
++}
++
++void PccSender::MaybeSetSendingRate() {
++  if (mode_ != PROBING || (interval_queue_.num_useful_intervals() ==
++                               2 * GetNumIntervalGroupsInProbing() &&
++                           !interval_queue_.current().is_useful)) {
++    // Do not change sending rate when (1) current mode is STARTING or
++    // DECISION_MADE (since sending rate is already changed in
++    // OnUtilityAvailable), or (2) more than 2 * GetNumIntervalGroupsInProbing()
++    // intervals have been created in PROBING mode.
++    return;
++  }
++
++  if (interval_queue_.num_useful_intervals() != 0) {
++    // Restore central sending rate.
++    RestoreCentralSendingRate();
++
++    if (interval_queue_.num_useful_intervals() ==
++        2 * GetNumIntervalGroupsInProbing()) {
++      // This is the first not useful monitor interval, its sending rate is the
++      // central rate.
++      return;
++    }
++  }
++
++  // Sender creates several groups of monitor intervals. Each group comprises an
++  // interval with increased sending rate and an interval with decreased sending
++  // rate. Which interval goes first is randomly decided.
++  if (interval_queue_.num_useful_intervals() % 2 == 0) {
++    direction_ = (rand() % 2 == 1) ? INCREASE : DECREASE;
++  } else {
++    direction_ = (direction_ == INCREASE) ? DECREASE : INCREASE;
++  }
++  if (direction_ == INCREASE) {
++    sending_rate_ = sending_rate_ * (1 + kProbingStepSize);
++  } else {
++    sending_rate_ = sending_rate_ * (1 - kProbingStepSize);
++  }
++}
++
++float PccSender::GetMaxRttFluctuationTolerance() const {
++  float tolerance_ratio =
++      mode_ == STARTING
++          ? FLAGS_max_rtt_fluctuation_tolerance_ratio_in_starting
++          : FLAGS_max_rtt_fluctuation_tolerance_ratio_in_decision_made;
++  return tolerance_ratio;
++}
++
++bool PccSender::CanMakeDecision(
++    const std::vector<UtilityInfo>& utility_info) const {
++  // Determine whether increased or decreased probing rate has better utility.
++  // Cannot make decision if number of utilities are less than
++  // 2 * GetNumIntervalGroupsInProbing(). This happens when sender does not have
++  // enough data to send.
++  if (utility_info.size() < 2 * GetNumIntervalGroupsInProbing()) {
++    return false;
++  }
++
++  bool increase = false;
++  // All the probing groups should have consistent decision. If not, directly
++  // return false.
++  for (size_t i = 0; i < GetNumIntervalGroupsInProbing(); ++i) {
++    bool increase_i =
++        utility_info[2 * i].utility > utility_info[2 * i + 1].utility
++            ? utility_info[2 * i].sending_rate >
++                  utility_info[2 * i + 1].sending_rate
++            : utility_info[2 * i].sending_rate <
++                  utility_info[2 * i + 1].sending_rate;
++
++    if (i == 0) {
++      increase = increase_i;
++    }
++    // Cannot make decision if groups have inconsistent results.
++    if (increase_i != increase) {
++      return false;
++    }
++  }
++
++  return true;
++}
++
++void PccSender::EnterProbing() {
++  switch (mode_) {
++    case STARTING:
++      // Fall back to the minimum between halved sending rate and
++      // max bandwidth * (1 - 0.05) if there is valid bandwidth sample.
++      // Otherwise, simply halve the current sending rate.
++	if (prev_sending_rate_.ToBitsPerSecond() > 0)
++	    sending_rate_ = prev_sending_rate_;
++//	    sending_rate_ = sending_rate_ * 0.5;
++      break;
++    case DECISION_MADE:
++      // FALLTHROUGH_INTENDED;
++    case PROBING:
++      // Reset sending rate to central rate when sender does not have enough
++      // data to send more than 2 * GetNumIntervalGroupsInProbing() intervals.
++      RestoreCentralSendingRate();
++      break;
++  }
++#ifdef DEBUG_PRINTS
++  std::cout << "Enter probing! Rate restored back to " << sending_rate_ << std::endl;
++#endif
++
++  if (mode_ == PROBING) {
++    ++rounds_;
++    return;
++  }
++
++  mode_ = PROBING;
++  rounds_ = 1;
++
++  if (utility_manager_.GetUtilityTag() == "Hybrid") {
++    std::string effective_utility_tag = "Hybrid";
++    float higher_probing_rate_mbps = static_cast<float>(
++            (sending_rate_ * (1 + kProbingStepSize)).ToBitsPerSecond()) /
++        static_cast<float>(kMegabit);
++    float hybrid_switching_rate_mbps =
++        *(float *)utility_manager_.GetUtilityParameter(0);
++    if (higher_probing_rate_mbps > hybrid_switching_rate_mbps) {
++      effective_utility_tag = "Scavenger";
++    }
++    utility_manager_.SetEffectiveUtilityTag(effective_utility_tag);
++  }
++}
++
++void PccSender::EnterDecisionMade() {
++  assert(PROBING == mode_);
++
++  // Change sending rate from central rate based on the probing rate with higher
++  // utility.
++  if (direction_ == INCREASE) {
++    sending_rate_ = sending_rate_ * (1 + kProbingStepSize) *
++                    (1 + kDecisionMadeStepSize);
++  } else {
++    sending_rate_ = sending_rate_ * (1 - kProbingStepSize) *
++                    (1 - kDecisionMadeStepSize);
++  }
++
++  mode_ = DECISION_MADE;
++  rounds_ = 1;
++}
++
++void PccSender::RestoreCentralSendingRate() {
++  switch (mode_) {
++    case STARTING:
++      // The sending rate upon exiting STARTING is set separately. This function
++      // should not be called while sender is in STARTING mode.
++      std::cerr << "Attempt to set probing rate while in STARTING";
++      break;
++    case PROBING:
++      // Change sending rate back to central probing rate.
++      if (interval_queue_.current().is_useful) {
++        if (direction_ == INCREASE) {
++          sending_rate_ = sending_rate_ * (1.0 / (1 + kProbingStepSize));
++        } else {
++          sending_rate_ = sending_rate_ * (1.0 / (1 - kProbingStepSize));
++        }
++      }
++      break;
++    case DECISION_MADE:
++      if (direction_ == INCREASE) {
++        sending_rate_ = sending_rate_ *
++                        (1.0 / (1 + std::min(rounds_ * kDecisionMadeStepSize,
++                                             kMaxDecisionMadeStepSize)));
++      } else {
++        sending_rate_ = sending_rate_ *
++                        (1.0 / (1 - std::min(rounds_ * kDecisionMadeStepSize,
++                                             kMaxDecisionMadeStepSize)));
++      }
++      break;
++  }
++
++}
++
++bool PccSender::CheckForRttInflation() {
++  if (interval_queue_.empty() ||
++      interval_queue_.front().rtt_on_monitor_start.IsZero() ||
++      latest_rtt_ <= avg_rtt_) {
++    // RTT is not inflated if latest RTT is no larger than smoothed RTT.
++    rtt_on_inflation_start_ = QuicTime::Delta::Zero();
++    return false;
++  }
++
++  // Once the latest RTT exceeds the smoothed RTT, store the corresponding
++  // smoothed RTT as the RTT at the start of inflation. RTT inflation will
++  // continue as long as latest RTT keeps being larger than smoothed RTT.
++  if (rtt_on_inflation_start_.IsZero()) {
++    rtt_on_inflation_start_ = avg_rtt_;
++  }
++
++  const float max_inflation_ratio = 1 + GetMaxRttFluctuationTolerance();
++  const QuicTime::Delta rtt_on_monitor_start =
++      FLAGS_trigger_early_termination_based_on_interval_queue_front
++          ? interval_queue_.front().rtt_on_monitor_start
++          : interval_queue_.current().rtt_on_monitor_start;
++  bool is_inflated =
++      max_inflation_ratio * rtt_on_monitor_start < avg_rtt_;
++  if (!is_inflated &&
++      FLAGS_enable_early_termination_based_on_latest_rtt_trend) {
++    // If enabled, check if early termination should be triggered according to
++    // the stored smoothed rtt on inflation start.
++    is_inflated = max_inflation_ratio * rtt_on_inflation_start_ <
++                      avg_rtt_;
++  }
++  if (is_inflated) {
++    // RTT is inflated by more than the tolerance, and early termination will be
++    // triggered. Reset the rtt on inflation start.
++    rtt_on_inflation_start_ = QuicTime::Delta::Zero();
++  }
++  return is_inflated;
++}
++
++/* static QuicString PccSenderModeToString(PccSender::SenderMode mode) {
++  switch (mode) {
++    case PccSender::STARTING:
++      return "STARTING";
++    case PccSender::PROBING:
++      return "PROBING";
++    case PccSender::DECISION_MADE:
++      return "DECISION_MADE";
++  }
++  return "???";
++}
++*/
++
++/*
++std::ostream& operator<<(std::ostream& os, const PccSender::DebugState& state) {
++  os << "Mode: " << PccSenderModeToString(state.mode) << std::endl;
++  os << "Sending rate: " << state.sending_rate.ToKBitsPerSecond() << std::endl;
++  os << "Latest rtt: " << state.latest_rtt.ToMicroseconds() << std::endl;
++  os << "Smoothed rtt: " << state.smoothed_rtt.ToMicroseconds() << std::endl;
++  os << "Rtt deviation: " << state.rtt_dev.ToMicroseconds() << std::endl;
++  os << "Monitor useful: " << (state.is_useful ? "yes" : "no") << std::endl;
++  os << "Monitor packet sent time: "
++     << state.first_packet_sent_time.ToDebuggingValue() << " -> "
++     << state.last_packet_sent_time.ToDebuggingValue() << std::endl;
++  os << "Monitor packet number: " << state.first_packet_number << " -> "
++     << state.last_packet_number << std::endl;
++  os << "Monitor bytes: " << state.bytes_sent << " (sent), "
++     << state.bytes_acked << " (acked), " << state.bytes_lost << " (lost)"
++     << std::endl;
++  os << "Monitor rtt change: " << state.rtt_on_monitor_start.ToMicroseconds()
++     << " -> " << state.rtt_on_monitor_end.ToMicroseconds() << std::endl;
++  os << "Latest utility: " << state.latest_utility << std::endl;
++  os << "Bandwidth sample: " << state.bandwidth.ToKBitsPerSecond() << std::endl;
++
++  return os;
++}
++*/
++
++}  // namespace quic
+diff --git a/quic/core/congestion_control/pcc_sender.h b/quic/core/congestion_control/pcc_sender.h
+new file mode 100644
+index 00000000..eabfa35d
+--- /dev/null
++++ b/quic/core/congestion_control/pcc_sender.h
+@@ -0,0 +1,271 @@
++// PCC (Performance Oriented Congestion Control) algorithm
++
++#ifndef NET_QUIC_CORE_CONGESTION_CONTROL_PCC_SENDER_H_
++#define NET_QUIC_CORE_CONGESTION_CONTROL_PCC_SENDER_H_
++
++#include <vector>
++#include <queue>
++
++#include "absl/base/macros.h"
++#include "quic/core/congestion_control/pcc_monitor_interval_queue.h"
++#include "quic/core/congestion_control/pcc_utility_manager.h"
++
++#include "quic/core/congestion_control/send_algorithm_interface.h"
++#include "quic/core/quic_bandwidth.h"
++#include "quic/core/quic_connection_stats.h"
++#include "quic/core/quic_time.h"
++#include "quic/core/quic_types.h"
++
++#include "pcc_monitor_interval_queue.h"
++#include "pcc_utility_manager.h"
++
++ namespace quic {
++
++ namespace test {
++ class PccSenderPeer;
++ }  // namespace test
++
++// class RttStats;
++
++// UtilityInfo is used to store <sending_rate, utility> pairs
++struct UtilityInfo {
++  UtilityInfo();
++  UtilityInfo(QuicBandwidth rate, float utility);
++  ~UtilityInfo() {}
++
++  QuicBandwidth sending_rate;
++  float utility;
++};
++
++typedef uint64_t QuicRoundTripCount;
++
++// PccSender implements the PCC congestion control algorithm. PccSender
++// evaluates the benefits of different sending rates by comparing their
++// utilities, and adjusts the sending rate towards the direction of
++// higher utility.
++class PccSender
++    :  public SendAlgorithmInterface,
++      public PccMonitorIntervalQueueDelegateInterface {
++ public:
++  // Sender's mode during a connection.
++  enum SenderMode {
++    // Initial phase of the connection. Sending rate gets doubled as
++    // long as utility keeps increasing, and the sender enters
++    // PROBING mode when utility decreases.
++    STARTING,
++    // Sender tries different sending rates to decide whether higher
++    // or lower sending rate has greater utility. Sender enters
++    // DECISION_MADE mode once a decision is made.
++    PROBING,
++    // Sender keeps increasing or decreasing sending rate until
++    // utility decreases, then sender returns to PROBING mode.
++    // TODO(tongmeng): a better name?
++    DECISION_MADE
++  };
++
++  // Indicates whether sender should increase or decrease sending rate.
++  enum RateChangeDirection { INCREASE, DECREASE };
++
++  // Debug state to be exported for purpose of troubleshoot.
++/*
++  struct DebugState {
++    explicit DebugState(const PccSender& sender);
++    DebugState(const DebugState& state) = default;
++
++    SenderMode mode;
++    QuicBandwidth sending_rate;
++    QuicTime::Delta latest_rtt;
++    QuicTime::Delta smoothed_rtt;
++    QuicTime::Delta rtt_dev;
++    bool is_useful;
++    QuicTime first_packet_sent_time;
++    QuicTime last_packet_sent_time;
++    QuicPacketNumber first_packet_number;
++    QuicPacketNumber last_packet_number;
++    QuicByteCount bytes_sent;
++    QuicByteCount bytes_acked;
++    QuicByteCount bytes_lost;
++    QuicTime::Delta rtt_on_monitor_start;
++    QuicTime::Delta rtt_on_monitor_end;
++    float latest_utility;
++    QuicBandwidth bandwidth;
++  };
++*/
++
++  PccSender(const RttStats* rtt_stats,
++            //const QuicUnackedPacketMap* unacked_packets,
++            QuicPacketCount initial_congestion_window,
++            QuicPacketCount max_congestion_window, QuicRandom* random);
++  PccSender(const PccSender&) = delete;
++  PccSender& operator=(const PccSender&) = delete;
++  PccSender(PccSender&&) = delete;
++  PccSender& operator=(PccSender&&) = delete;
++  ~PccSender() override {}
++
++  // Start implementation of SendAlgorithmInterface.
++
++  bool InSlowStart() const override;
++
++
++  bool InRecovery() const override;
++
++  void SetFromConfig(const QuicConfig& config,
++                     Perspective perspective) override {}
++  void ApplyConnectionOptions(
++      const QuicTagVector& connection_options) override {}
++  void SetInitialCongestionWindowInPackets(QuicPacketCount packets) override {}
++
++  void AdjustNetworkParameters(const NetworkParams& params) override {}
++  void OnCongestionEvent(bool rtt_updated,
++                         QuicByteCount prior_in_flight,
++                         QuicTime event_time,
++                         const AckedPacketVector& acked_packets,
++                         const LostPacketVector& lost_packets) override;
++  void OnPacketSent(QuicTime sent_time,
++                    QuicByteCount bytes_in_flight,
++                    QuicPacketNumber packet_number,
++                    QuicByteCount bytes,
++                    HasRetransmittableData is_retransmittable) override;
++  void OnRetransmissionTimeout(bool packets_retransmitted) override {}
++  void OnPacketNeutered(QuicPacketNumber packet_number) override {}
++  void OnConnectionMigration() override {}
++  bool CanSend(QuicByteCount bytes_in_flight) override;
++  QuicBandwidth PacingRate(QuicByteCount bytes_in_flight) const override;
++  QuicBandwidth BandwidthEstimate() const override;
++  QuicByteCount GetCongestionWindow() const override;
++  QuicByteCount GetSlowStartThreshold() const override;
++  CongestionControlType GetCongestionControlType() const override;
++  std::string GetDebugState() const override;
++  void OnApplicationLimited(QuicByteCount bytes_in_flight) override;
++  bool ShouldSendProbingPacket() const override { return false; }
++  void PopulateConnectionStats(QuicConnectionStats* stats) const  override {}
++
++  // End implementation of SendAlgorithmInterface.
++
++  // Implementation of PccMonitorIntervalQueueDelegate.
++  // Called when all useful intervals' utilities are available,
++  // so the sender can make a decision.
++  void OnUtilityAvailable(
++      const std::vector<const MonitorInterval *>& useful_intervals,
++      QuicTime event_time) override;
++
++  size_t GetNumIntervalGroupsInProbing() const;
++
++  // Set the utility function used by pcc sender.
++  void SetUtilityTag(std::string utility_tag);
++  // Set the parameter needed by utility function.
++  void SetUtilityParameter(void* param);
++
++  // Generate PCC DebugState.
++/*
++  DebugState ExportDebugState() const;
++*/
++
++ protected:
++  void UpdateRtt(QuicTime event_time, QuicTime::Delta rtt);
++
++  // Returns true if a new monitor interval needs to be created.
++  bool CreateNewInterval(QuicTime event_time);
++  // Returns true if next created monitor interval is useful,
++  // i.e., its utility will be used when a decision can be made.
++  bool CreateUsefulInterval() const;
++  // Returns the sending rate for non-useful monitor interval.
++  virtual QuicBandwidth GetSendingRateForNonUsefulInterval() const;
++  // Maybe set sending_rate_ for next created monitor interval.
++  void MaybeSetSendingRate();
++  // Returns the max RTT fluctuation tolerance according to sender mode.
++  float GetMaxRttFluctuationTolerance() const;
++
++  // Set sending rate to central probing rate for the coming round of PROBING.
++  void RestoreCentralSendingRate();
++  // Returns true if the sender can enter DECISION_MADE from PROBING mode.
++  virtual bool CanMakeDecision(const std::vector<UtilityInfo>& utility_info) const;
++  // Set the sending rate to the central rate used in PROBING mode.
++  void EnterProbing();
++  // Set the sending rate when entering DECISION_MADE from PROBING mode.
++  void EnterDecisionMade();
++
++  // Returns true if the RTT inflation is larger than the tolerance.
++  bool CheckForRttInflation();
++
++  // Update the bandwidth sampler when OnCongestionEvent is called.
++/*
++  void UpdateBandwidthSampler(QuicTime event_time,
++                              const AckedPacketVector& acked_packets,
++                              const LostPacketVector& lost_packets);
++*/
++
++  // Current mode of PccSender.
++  SenderMode mode_;
++  // Sending rate for the next monitor intervals.
++  QuicBandwidth sending_rate_;
++  QuicBandwidth prev_sending_rate_;
++  // Initialized to be false, and set to true after receiving the first ACK.
++  bool has_seen_valid_rtt_;
++  // Most recent utility used when making the last rate change decision.
++  float latest_utility_;
++
++  QuicTime conn_start_time_;
++
++  // Duration of the current monitor interval.
++  QuicTime::Delta monitor_duration_;
++  // Current direction of rate changes.
++  RateChangeDirection direction_;
++  // Number of rounds sender remains in current mode.
++  size_t rounds_;
++  // Queue of monitor intervals with pending utilities.
++  PccMonitorIntervalQueue interval_queue_;
++
++  // Smoothed RTT before consecutive inflated RTTs happen.
++  QuicTime::Delta rtt_on_inflation_start_;
++
++  // Maximum congestion window in bytes, used to cap sending rate.
++  QuicByteCount max_cwnd_bytes_;
++
++  QuicTime::Delta rtt_deviation_;
++  QuicTime::Delta min_rtt_deviation_;
++  QuicTime::Delta latest_rtt_;
++  QuicTime::Delta min_rtt_;
++  QuicTime::Delta avg_rtt_;
++  // const QuicUnackedPacketMap* unacked_packets_;
++  const RttStats* rtt_stats_;
++  QuicRandom* random_;
++
++  // Bandwidth sample provides the bandwidth measurement that is used when
++  // exiting STARTING phase upon early termination.
++  // BandwidthSampler sampler_;
++  // Filter that tracks maximum bandwidth over multiple recent round trips.
++  // MaxBandwidthFilter max_bandwidth_;
++  // Packet number for the most recently sent packet.
++  // QuicPacketNumber last_sent_packet_;
++  // Largest packet number that is sent in current round trips.
++  // QuicPacketNumber current_round_trip_end_;
++  // Number of round trips since connection start.
++  // QuicRoundTripCount round_trip_count_;
++  // Latched value of FLAGS_exit_starting_based_on_sampled_bandwidth.
++  const bool exit_starting_based_on_sampled_bandwidth_;
++
++  // Time when the most recent packet is sent.
++  QuicTime latest_sent_timestamp_;
++  // Time when the most recent ACK is received.
++  QuicTime latest_ack_timestamp_;
++
++  // Utility manager is responsible for utility calculation.
++  PccUtilityManager utility_manager_;
++
++  QuicBandwidth max_bw_;
++  QuicBandwidth min_bw_;
++  bool max_bw_valid_;
++  bool min_bw_valid_;
++};
++
++// Overload operator for purpose of PCC DebugState printing
++/*
++QUIC_EXPORT_PRIVATE std::ostream& operator<<(
++    std::ostream& os,
++    const PccSender::DebugState& state);
++*/
++
++}  // namespace quic
++
++#endif
+diff --git a/quic/core/congestion_control/pcc_utility_manager.cc b/quic/core/congestion_control/pcc_utility_manager.cc
+new file mode 100644
+index 00000000..f6547d5a
+--- /dev/null
++++ b/quic/core/congestion_control/pcc_utility_manager.cc
+@@ -0,0 +1,940 @@
++#include "pcc_utility_manager.h"
++#include "quic/platform/api/quic_flags.h"
++#include "math.h"
++#include <assert.h>
++#include <iostream>
++
++//#include "third_party/pcc_quic/pcc_utility_manager.h"
++
++//#include "third_party/quic/core/congestion_control/rtt_stats.h"
++
++static int32_t con_min_bw = 0;
++static int32_t con_max_bw = 0;
++
++namespace quic {
++
++namespace {
++const QuicByteCount kMaxPacketSize = 1500;
++// Number of bits per byte.
++const size_t kBitsPerByte = 8;
++const size_t kRttHistoryLen = 6;
++
++// Tolerance of loss rate by Allegro utility function.
++const float kLossTolerance = 0.05f;
++// Coefficeint of the loss rate term in Allegro utility function.
++const float kLossCoefficient = -1000.0f;
++// Coefficient of RTT term in Allegro utility function.
++const float kRTTCoefficient = -200.0f;
++
++// Exponent of sending rate contribution term in Vivace utility function.
++const float kSendingRateExponent = 0.9f;
++// Coefficient of loss penalty term in Vivace utility function.
++const float kVivaceLossCoefficient = 11.35f;
++// Coefficient of latency penalty term in Vivace utility function.
++//const float kLatencyCoefficient = 900.0f;
++const float kLatencyCoefficient = 25.0f;
++
++// Coefficient of rtt deviation term in Scavenger utility function.
++const float kRttDeviationCoefficient = 0.000075f;
++
++// The factor for sending rate transform in hybrid utility function.
++const float kHybridUtilityRateTransformFactor = 0.1f;
++
++// The update rate for moving average variable.
++const float kAlpha = 0.1f;
++// The order of magnitude that distinguishes abnormal sample.
++const float kBeta = 100.0f;
++
++// The threshold for ratio of monitor interval count, above which moving average
++// of trending RTT metrics (gradient and deviation) would be reset.
++const float kTrendingResetIntervalRatio = 0.95f;
++
++// Number of deviation above/below average trending gradient used for RTT
++//inflation tolerance for primary and scavenger senders.
++const float kInflationToleranceGainHigh = 2.0f;
++const float kInflationToleranceGainLow = 2.0f;
++
++// Ignore low gradient
++const float kRttGradientTolerance = 0.02;
++
++const size_t kLostPacketTolerance = 10;
++
++const float kRttVarianceTolerance = 500.0;
++}  // namespace
++
++PccUtilityManager::PccUtilityManager()
++    : utility_tag_("Allegro"),
++      effective_utility_tag_("Allegro"),
++      lost_bytes_tolerance_quota_(kMaxPacketSize * kLostPacketTolerance),
++      avg_mi_rtt_dev_(-1.0),
++      dev_mi_rtt_dev_(-1.0),
++      min_rtt_(-1.0),
++      avg_trending_gradient_(-1.0),
++      min_trending_gradient_(-1.0),
++      dev_trending_gradient_(-1.0),
++      last_trending_gradient_(-1.0),
++      avg_trending_dev_(-1.0),
++      min_trending_dev_(-1.0),
++      dev_trending_dev_(-1.0),
++      last_trending_dev_(-1.0),
++      ratio_inflated_mi_(0),
++      ratio_fluctuated_mi_(0),
++      is_rtt_inflation_tolerable_(true),
++      is_rtt_dev_tolerable_(true),
++      avg_ack_rate_mbps_(0.0){}
++
++const std::string PccUtilityManager::GetUtilityTag() const {
++  return utility_tag_;
++}
++
++const std::string PccUtilityManager::GetEffectiveUtilityTag() const {
++  return effective_utility_tag_;
++}
++
++void PccUtilityManager::SetUtilityTag(std::string utility_tag) {
++  utility_tag_ = utility_tag;
++  effective_utility_tag_ = utility_tag;
++  std::cerr << "Using Utility Function: " << utility_tag_ << std::endl;
++}
++
++void PccUtilityManager::SetEffectiveUtilityTag(std::string utility_tag) {
++  effective_utility_tag_ = utility_tag;
++}
++
++void* PccUtilityManager::GetUtilityParameter(unsigned long parameter_index) const {
++  return utility_parameters_.size() > parameter_index
++      ? utility_parameters_[parameter_index]
++      : (new float(0.0f));
++}
++
++void PccUtilityManager::SetUtilityParameter(void* param) {
++  if (utility_tag_ == "HybridAllegro" || utility_tag_ == "HybridVivace" ||
++      utility_tag_ == "Proportional" || utility_tag_ == "Scavenger" ||
++      utility_tag_ == "RateLimiter" || utility_tag_ == "TEST" ||
++      utility_tag_ == "Hybrid") {
++    utility_parameters_.push_back(new float(*(float *)param));
++    std::cerr << "Update Utility Parameter: " << (*(float *)param) << std::endl;
++  }
++}
++
++void PccUtilityManager::PrepareStatistics(const MonitorInterval* interval) {
++  PreProcessing(interval);
++
++  ComputeSimpleMetrics(interval);
++  ComputeApproxRttGradient(interval);
++  ComputeRttGradient(interval);
++  ComputeRttDeviation(interval);
++  ComputeRttGradientError(interval);
++
++  DetermineToleranceGeneral();
++  ProcessRttTrend(interval);
++}
++
++float PccUtilityManager::CalculateUtility(const MonitorInterval* interval,
++                                          QuicTime::Delta event_time) {
++  // The caller should guarantee utility of this interval is available.
++  assert(interval->first_packet_sent_time !=
++              interval->last_packet_sent_time);
++
++  PrepareStatistics(interval);
++
++  float utility = 0.0;
++  if (utility_tag_ == "Allegro") {
++    utility = CalculateUtilityAllegro(interval);
++  } else if (utility_tag_ == "Vivace") {
++    utility = CalculateUtilityVivace(interval);
++  } else if (utility_tag_ == "Hercules") {
++    utility = CalculateUtilityHercules(interval);
++  } else if (utility_tag_ == "Proportional") {
++    float latency_coefficient = *(float *)(utility_parameters_[0]);
++    float loss_coefficient = *(float *)(utility_parameters_[1]);
++    utility = CalculateUtilityProportional(interval, latency_coefficient,
++                                     loss_coefficient);
++  } else if (utility_tag_ == "Scavenger") {
++    float rtt_deviation_coefficient = *(float *)(utility_parameters_[0]);
++    utility = CalculateUtilityScavenger(interval, rtt_deviation_coefficient, kLatencyCoefficient);
++  } else if (utility_tag_ == "HybridAllegro") {
++    float bound = *(float *)(utility_parameters_[0]);
++    utility = CalculateUtilityHybridAllegro(interval, bound);
++  } else if (utility_tag_ == "HybridVivace") {
++    float bound = *(float *)utility_parameters_[0];
++    utility = CalculateUtilityHybridVivace(interval, bound);
++  } else if (utility_tag_ == "RateLimiter") {
++    float bound = *(float *)utility_parameters_[0];
++    float rate_limiter_parameter = 0.9 / pow(bound, 0.1);
++    utility = CalculateUtilityRateLimiter(interval, rate_limiter_parameter);
++  } else if (utility_tag_ == "Hybrid") {
++    float rate_bound = *(float *)utility_parameters_[0];
++    utility = CalculateUtilityHybrid(interval, rate_bound);
++  } else if (utility_tag_ == "TEST") {
++    float latency_coefficient = *(float *)(utility_parameters_[0]);
++    float loss_coefficient = *(float *)(utility_parameters_[1]);
++    utility = CalculateUtilityTEST(interval, latency_coefficient,
++                                   loss_coefficient);
++  } else {
++    std::cerr << "Unrecognized utility tag, use Allegro instead" << std::endl;
++    utility = CalculateUtilityAllegro(interval);
++  }
++#ifdef PER_MI_DEBUG_
++  std::cerr << event_time.ToMicroseconds() / 1000000.0 << " "
++            << interval->sending_rate.ToKBitsPerSecond() << " "
++            << interval_stats_.actual_sending_rate_mbps << " "
++            << interval_stats_.avg_rtt << " "
++            << interval_stats_.min_rtt << " "
++            << interval_stats_.max_rtt << " "
++            << interval_stats_.max_rtt - interval_stats_.min_rtt << " "
++            << interval->rtt_on_monitor_end.ToMicroseconds() << " "
++            << interval_stats_.rtt_dev << " "
++            << avg_mi_rtt_dev_ << " "
++            << interval_stats_.rtt_dev / interval_stats_.avg_rtt << " "
++            << interval_stats_.approx_rtt_gradient << " "
++            << interval_stats_.loss_rate << " "
++            << utility << " "
++            << std::abs(interval_stats_.rtt_gradient) << " "
++            << interval_stats_.rtt_gradient_error << " "
++            << std::abs(interval_stats_.rtt_gradient) -
++                   interval_stats_.rtt_gradient_error << " "
++            << interval_stats_.trending_gradient << " "
++            << avg_trending_gradient_ << " "
++            << dev_trending_gradient_ << " "
++            << avg_trending_gradient_ - 2 * dev_trending_gradient_ << " "
++            << avg_trending_gradient_ + 2 * dev_trending_gradient_;
++  if (utility_tag_ == "Scavenger") {
++    std::cerr << " " << CalculateUtilityVivace(interval);
++  }
++  std::cerr << std::endl;
++  std::cerr << "Utility function type: " << utility_tag_ << std::endl;
++#endif
++  return utility;
++}
++
++float PccUtilityManager::CalculateUtilityAllegro(
++    const MonitorInterval* interval) {
++#ifdef DEBUG_PRINTS
++  std::cerr << "Ratio before: " << interval_stats_.rtt_ratio;
++#endif
++  if (interval_stats_.rtt_ratio >
++          1.0 - interval->rtt_fluctuation_tolerance_ratio &&
++      interval_stats_.rtt_ratio <
++          1.0 + interval->rtt_fluctuation_tolerance_ratio) {
++    interval_stats_.rtt_ratio = 1.0;
++  }
++  float latency_penalty = 1.0 -
++      1.0 / (1.0 + exp(kRTTCoefficient * (1.0 - interval_stats_.rtt_ratio)));
++
++  float loss_penalty =
++      1.0 - 1.0 / (1.0 + exp(kLossCoefficient *
++                             (interval_stats_.loss_rate - kLossTolerance)));
++
++  float bytes_acked = static_cast<float>(interval->bytes_acked);
++  float bytes_lost = static_cast<float>(interval->bytes_lost);
++#ifdef DEBUG_PRINTS
++  std::cerr << ", rtt_ratio: " << interval_stats_.rtt_ratio
++      << ", latency penalty: " << latency_penalty << ", loss_penalty: " << loss_penalty
++      << ", bytes_acked: " << bytes_acked << ", bytes_lost: " << bytes_lost
++      << ", exp(kRTTCoefficient..): " << exp(kRTTCoefficient * (1.0 - interval_stats_.rtt_ratio))
++      << ", exp(kLossCoefficient..): " << exp(kLossCoefficient *
++                             (interval_stats_.loss_rate - kLossTolerance))
++      << ", rtt_fluctuation: " << interval->rtt_fluctuation_tolerance_ratio
++      << std::endl;
++#endif
++  return (bytes_acked / interval_stats_.interval_duration * loss_penalty *
++              latency_penalty -
++          bytes_lost / interval_stats_.interval_duration) * 1000.0;
++}
++
++float PccUtilityManager::CalculateUtilityVivace(
++    const MonitorInterval* interval) {
++  return CalculateUtilityProportional(interval, kLatencyCoefficient,
++                                   kVivaceLossCoefficient);
++}
++
++#define MIN(a,b) ((a) < (b)? (a) : (b))
++float PccUtilityManager::CalculateUtilityHercules(
++    const MonitorInterval* interval) {
++    float latency_coefficient = kLatencyCoefficient;
++    float rtt_dev_coefficient = kRttDeviationCoefficient;
++//    float sending_rate = static_cast<float>(interval->sending_rate.ToBitsPerSecond());
++    float sending_rate = static_cast<float>(interval->sending_rate.ToBitsPerSecond());
++    float actual_rate = MIN(avg_ack_rate_mbps_ * MEGA, sending_rate);
++
++    if (con_min_bw > 0 && con_max_bw > con_min_bw) {
++	float hercules = GetHercules(actual_rate,
++		static_cast<float>(con_min_bw), static_cast<float>(con_max_bw));
++/*	if (actual_rate < con_min_bw) {
++	    hercules *= hercules;
++#ifdef DEBUG_PRINTS
++	    std::cout << "Send rate <= min. Hecules Changed to " << hercules << std::endl;
++#endif
++	} else if (sending_rate > con_min_bw * BW_MAX_LIMIT) {
++//	    hercules = 1.0 / (1.0 - hercules);
++	    hercules *= (sending_rate / (con_min_bw * BW_MAX_LIMIT));
++#ifdef DEBUG_PRINTS
++	    std::cout << "Send rate >= BW_MAX_LIMIT. Hecules Changed to " << hercules << std::endl;
++#endif
++	}*/
++	latency_coefficient *= hercules;
++	rtt_dev_coefficient *= hercules;
++#ifdef DEBUG_PRINTS
++        unsigned long i;
++	std::cout << "RTT values in microseconds: ";
++	for(i=0; i < interval->packet_rtt_samples.size(); i++)
++	    std::cout << " " << interval->packet_rtt_samples[i].sample_rtt.ToMicroseconds();
++	std::cout << std::endl;
++#endif
++    }
++  return CalculateUtilityScavenger(interval, rtt_dev_coefficient, latency_coefficient);
++}
++
++float PccUtilityManager::CalculateUtilityProportional(
++    const MonitorInterval* interval,
++    float latency_coefficient,
++    float loss_coefficient) {
++// float sending_rate = MIN (static_cast<float>(interval->sending_rate.ToBitsPerSecond()) / MEGA,
++//	  interval_stats_.ack_rate_mbps); //Limit send rate to arrival rate
++  float sending_rate = static_cast<float>(interval->sending_rate.ToBitsPerSecond()) / MEGA;
++  float sending_rate_contribution =
++      pow(sending_rate, kSendingRateExponent);
++
++/*  float rtt_gradient =
++      is_rtt_inflation_tolerable_ ? 0.0 : interval_stats_.rtt_gradient;
++  if (interval->rtt_fluctuation_tolerance_ratio > 50.0 &&
++      std::abs(rtt_gradient) < 1000.0 / interval_stats_.interval_duration) {
++    rtt_gradient = 0.0;
++  }*/
++  float rtt_gradient = interval_stats_.rtt_gradient;
++  if (rtt_gradient < 0) {
++    rtt_gradient = 0.0;
++  }
++  if (rtt_gradient < kRttGradientTolerance) {
++    rtt_gradient = 0.0;
++  }
++  //Don't take latency penalty on the lower rate
++  if(interval->is_increase == false) {
++    rtt_gradient = 0.0;
++  }
++
++
++  float latency_penalty = latency_coefficient * rtt_gradient *
++                          sending_rate;
++
++  float loss_penalty = loss_coefficient * interval_stats_.loss_rate *
++                       sending_rate;
++
++/*  std::cerr << "RTT gradient: " << rtt_gradient << ", RTT grad org: " << interval_stats_.rtt_gradient
++      << ", ack_rate: " << interval_stats_.ack_rate_mbps
++      << ", latency_penalty: " << latency_penalty << ", loss_penalty: " << loss_penalty
++      << ", Loss rate: " <<  interval_stats_.loss_rate << std::endl;*/
++  return sending_rate_contribution - latency_penalty - loss_penalty;
++}
++
++float PccUtilityManager::CalculateUtilityScavenger(
++    const MonitorInterval* interval,
++    float rtt_variance_coefficient,
++    float latency_coefficient) {
++/*  float sending_rate = MIN (static_cast<float>(interval->sending_rate.ToBitsPerSecond()) / MEGA,
++	  interval_stats_.ack_rate_mbps); //Limit send rate to arrival rate*/
++  float sending_rate = static_cast<float>(interval->sending_rate.ToBitsPerSecond()) / MEGA;
++  float sending_rate_contribution =
++      pow(sending_rate, kSendingRateExponent);
++  float loss_penalty = kVivaceLossCoefficient * interval_stats_.loss_rate * sending_rate;
++//                       interval_stats_.actual_sending_rate_mbps;
++
++  float rtt_gradient =
++      is_rtt_inflation_tolerable_ ? 0.0 : interval_stats_.rtt_gradient;
++  float rtt_variance_tolerance = kRttVarianceTolerance;
++
++  if (interval->rtt_fluctuation_tolerance_ratio > 50.0 &&
++      std::abs(rtt_gradient) < 1000.0 / interval_stats_.interval_duration) {
++    rtt_gradient = 0.0;
++  }
++  if (rtt_gradient < 0) {
++    rtt_gradient = 0.0;
++  }
++  if (rtt_gradient < kRttGradientTolerance) {
++    rtt_gradient = 0.0;
++  }
++  if(interval->is_increase == false) {
++    rtt_gradient = 0.0;
++  }
++  float latency_penalty = latency_coefficient * rtt_gradient * sending_rate;
++//                         interval_stats_.actual_sending_rate_mbps;
++
++  float rtt_dev = /*is_rtt_dev_tolerable_ ? 0.0 :*/ interval_stats_.rtt_dev;
++  if (interval->rtt_fluctuation_tolerance_ratio > 50.0) {
++    rtt_dev = 0.0;
++  }
++  // In case of decision made and quick decrease, ignore variant which comes from RTT deflation
++  if (interval->do_rttdev_dec && interval->rtt_on_monitor_start > interval->rtt_on_monitor_end) {
++      rtt_variance_tolerance += static_cast<float>
++	  ((interval->rtt_on_monitor_start - interval->rtt_on_monitor_end).ToMicroseconds() / 2);
++  }
++  if (rtt_dev < rtt_variance_tolerance) {
++      rtt_dev = 0.0;
++  }
++  if(interval->is_increase == false) {
++    rtt_dev = 0.0;
++  }
++  float rtt_dev_penalty = rtt_variance_coefficient * rtt_dev *
++//                          interval_stats_.actual_sending_rate_mbps;
++                            sending_rate;
++
++#ifdef DEBUG_PRINTS
++  std::cerr << "RTT gradient: " << rtt_gradient << ", RTT grad org: " << interval_stats_.rtt_gradient
++      << ", ack_rate: " << interval_stats_.ack_rate_mbps
++      << ", latency_penalty: " << latency_penalty << ", loss_penalty: " << loss_penalty
++      << ", Loss rate: " <<  interval_stats_.loss_rate << ", rtt_dev: " << rtt_dev << ", rtt dev org: "
++      << interval_stats_.rtt_dev << ", rtt_dev_penalty: " << rtt_dev_penalty
++      << ", RTT grad error: " << interval_stats_.rtt_gradient_error
++      << ", num: " << interval->packet_rtt_samples.size()  << std::endl;
++#endif
++
++  return sending_rate_contribution - loss_penalty -
++      latency_penalty - rtt_dev_penalty;
++}
++
++float PccUtilityManager::CalculateUtilityHybridAllegro(
++    const MonitorInterval* interval,
++    float bound) {
++  float allegro_utility = CalculateUtilityAllegro(interval);
++
++  if (interval_stats_.actual_sending_rate_mbps < bound) {
++    return allegro_utility;
++  } else {
++    float perfect_utility = CalculatePerfectUtilityAllegro(
++        interval_stats_.actual_sending_rate_mbps);
++
++    float bounded_sending_rate_mbps = bound +
++        (interval_stats_.actual_sending_rate_mbps - bound) *
++            kHybridUtilityRateTransformFactor;
++    float bounded_perfect_utility =
++        CalculatePerfectUtilityAllegro(bounded_sending_rate_mbps);
++
++    return bounded_perfect_utility * (allegro_utility / perfect_utility);
++  }
++}
++
++float PccUtilityManager::CalculateUtilityHybridVivace(
++    const MonitorInterval* interval,
++    float bound) {
++  float vivace_utility = CalculateUtilityVivace(interval);
++
++  if (interval_stats_.actual_sending_rate_mbps < bound) {
++    return vivace_utility;
++  } else {
++    float perfect_utility = CalculatePerfectUtilityVivace(
++        interval_stats_.actual_sending_rate_mbps);
++
++    float bounded_sending_rate_mbps = bound +
++        (interval_stats_.actual_sending_rate_mbps - bound) *
++            kHybridUtilityRateTransformFactor;
++    float bounded_perfect_utility =
++        CalculatePerfectUtilityVivace(bounded_sending_rate_mbps);
++
++    return bounded_perfect_utility + vivace_utility - perfect_utility;
++  }
++}
++
++float PccUtilityManager::CalculateUtilityHybridVivace2(
++    const MonitorInterval* interval,
++    float bound) {
++  float vivace_utility = CalculateUtilityVivace(interval);
++
++  if (interval_stats_.actual_sending_rate_mbps < bound) {
++    return vivace_utility;
++  } else {
++    float perfect_utility = CalculatePerfectUtilityVivace(
++        interval_stats_.actual_sending_rate_mbps);
++
++    float bounded_sending_rate_mbps = bound +
++        (interval_stats_.actual_sending_rate_mbps - bound) *
++            kHybridUtilityRateTransformFactor;
++    float bounded_perfect_utility =
++        CalculatePerfectUtilityVivace(bounded_sending_rate_mbps);
++
++    return bounded_perfect_utility * (vivace_utility / perfect_utility);
++  }
++}
++
++float PccUtilityManager::CalculateUtilityRateLimiter(
++    const MonitorInterval* interval,
++    float rate_limiter_parameter) {
++  float vivace_utility = CalculateUtilityVivace(interval);
++
++  float rate_penalty =
++      rate_limiter_parameter * interval_stats_.actual_sending_rate_mbps;
++  return vivace_utility - rate_penalty;
++}
++
++float PccUtilityManager::CalculateUtilityHybrid(
++    const MonitorInterval* interval,
++    float rate_bound) {
++  if (interval_stats_.actual_sending_rate_mbps < rate_bound) {
++    return CalculateUtilityVivace(interval);
++  } else {
++    return CalculateUtilityScavenger(interval, kRttDeviationCoefficient, kLatencyCoefficient);
++  }
++}
++
++float PccUtilityManager::CalculateUtilityTEST(
++    const MonitorInterval* interval,
++    float latency_coefficient,
++    float loss_coefficient) {
++  return CalculateUtilityVivace(interval);
++}
++
++float PccUtilityManager::CalculatePerfectUtilityAllegro(
++    float sending_rate_mbps) {
++  float rtt_ratio = 1.0;
++  float latency_penalty =
++      1.0 - 1.0 / (1.0 + exp(kRTTCoefficient * (1.0 - rtt_ratio)));
++
++  float loss_rate = 0.0f;
++  float loss_penalty =
++      1.0 - 1.0 / (1.0 + exp(kLossCoefficient * (loss_rate - kLossTolerance)));
++
++  float sending_rate_bype_per_usec =
++      sending_rate_mbps / static_cast<float>(kBitsPerByte);
++
++  return (sending_rate_bype_per_usec * loss_penalty * latency_penalty) * 1000.0;
++}
++
++float PccUtilityManager::CalculatePerfectUtilityVivace(
++    float sending_rate_mbps) {
++  return pow(sending_rate_mbps, kSendingRateExponent);
++}
++
++void PccUtilityManager::PreProcessing(const MonitorInterval* interval) {
++  interval_stats_.marked_lost_bytes = 0;
++}
++
++void PccUtilityManager::ComputeSimpleMetrics(const MonitorInterval* interval) {
++  // Add the transfer time of the last packet in the monitor interval when
++  // calculating monitor interval duration.
++  interval_stats_.interval_duration = static_cast<float>(
++      (interval->last_packet_sent_time - interval->first_packet_sent_time +
++       interval->sending_rate.TransferTime(kMaxPacketSize)).ToMicroseconds());
++  if (interval->packet_rtt_samples.size() == 1) {
++      const QuicTime *pbase = &interval->base_ack_time;
++      if (!interval->base_ack_time.IsInitialized())
++	  pbase = &interval->first_packet_sent_time;
++      interval_stats_.interval_duration = static_cast<float>((interval->last_ack_time - *pbase).ToMicroseconds());
++  }
++
++  interval_stats_.rtt_ratio =
++      static_cast<float>(interval->rtt_on_monitor_start.ToMicroseconds()) /
++      static_cast<float>(interval->rtt_on_monitor_end.ToMicroseconds());
++  interval_stats_.loss_rate =
++      static_cast<float>(interval->bytes_lost -
++                         interval_stats_.marked_lost_bytes) /
++      static_cast<float>(interval->bytes_sent);
++  interval_stats_.actual_sending_rate_mbps =
++      static_cast<float>(interval->bytes_sent) *
++      static_cast<float>(kBitsPerByte) / interval_stats_.interval_duration;
++
++  size_t num_rtt_samples = interval->packet_rtt_samples.size();
++  if (num_rtt_samples > 1) {
++    QuicByteCount acked = interval->bytes_acked;
++    float ack_duration = static_cast<float>(
++        (interval->packet_rtt_samples[num_rtt_samples - 1].ack_timestamp -
++         interval->packet_rtt_samples[0].ack_timestamp).ToMicroseconds());
++    interval_stats_.ack_rate_mbps =
++        static_cast<float>(acked > kMaxPacketSize? acked - kMaxPacketSize: acked) *
++        static_cast<float>(kBitsPerByte) / ack_duration;
++    if (avg_ack_rate_mbps_ == 0.0)
++	avg_ack_rate_mbps_ = interval_stats_.ack_rate_mbps;
++    else
++	avg_ack_rate_mbps_ = (avg_ack_rate_mbps_ * 0.75) + (interval_stats_.ack_rate_mbps * 0.25);
++  } else if (num_rtt_samples == 1) {
++    interval_stats_.ack_rate_mbps =
++        static_cast<float>(interval->bytes_acked) /
++        interval_stats_.interval_duration;
++  } else {
++    interval_stats_.ack_rate_mbps = 0;
++  }
++}
++
++void PccUtilityManager::ComputeApproxRttGradient(
++    const MonitorInterval* interval) {
++  // Separate all RTT samples in the interval into two halves, and calculate an
++  // approximate RTT gradient.
++  QuicTime::Delta rtt_first_half = QuicTime::Delta::Zero();
++  QuicTime::Delta rtt_second_half = QuicTime::Delta::Zero();
++  size_t num_half_samples = interval->packet_rtt_samples.size() / 2;
++  size_t num_first_half_samples = 0;
++  size_t num_second_half_samples = 0;
++  for (size_t i = 0; i < num_half_samples; ++i) {
++    if (interval->packet_rtt_samples[i].is_reliable_for_gradient_calculation) {
++      rtt_first_half = rtt_first_half +
++          interval->packet_rtt_samples[i].sample_rtt;
++      num_first_half_samples++;
++    }
++    if (interval->packet_rtt_samples[i + num_half_samples]
++                 .is_reliable_for_gradient_calculation) {
++      rtt_second_half = rtt_second_half +
++          interval->packet_rtt_samples[i + num_half_samples].sample_rtt;
++      num_second_half_samples++;
++    }
++  }
++
++  if (num_first_half_samples == 0 || num_second_half_samples == 0) {
++    interval_stats_.approx_rtt_gradient = 0.0;
++    return;
++  }
++  rtt_first_half =
++      rtt_first_half * (1.0 / static_cast<float>(num_first_half_samples));
++  rtt_second_half =
++      rtt_second_half * (1.0 / static_cast<float>(num_second_half_samples));
++  interval_stats_.approx_rtt_gradient = 2.0 *
++      static_cast<float>((rtt_second_half - rtt_first_half).ToMicroseconds()) /
++      static_cast<float>((rtt_second_half + rtt_first_half).ToMicroseconds());
++}
++
++void PccUtilityManager::ComputeRttGradient(const MonitorInterval* interval) {
++  if (interval->num_reliable_rtt_for_gradient_calculation < 2) {
++    interval_stats_.rtt_gradient = 0;
++    interval_stats_.rtt_gradient_cut = 0;
++    return;
++  }
++
++  // Calculate RTT gradient using linear regression.
++  float gradient_x_avg = 0.0;
++  float gradient_y_avg = 0.0;
++  float gradient_x = 0.0;
++  float gradient_y = 0.0;
++  for (const PacketRttSample& rtt_sample : interval->packet_rtt_samples) {
++    if (!rtt_sample.is_reliable_for_gradient_calculation) {
++      continue;
++    }
++    gradient_x_avg += static_cast<float>(rtt_sample.packet_number.ToUint64());
++    gradient_y_avg +=
++        static_cast<float>(rtt_sample.sample_rtt.ToMicroseconds());
++  }
++  gradient_x_avg /=
++      static_cast<float>(interval->num_reliable_rtt_for_gradient_calculation);
++  gradient_y_avg /=
++      static_cast<float>(interval->num_reliable_rtt_for_gradient_calculation);
++  for (const PacketRttSample& rtt_sample : interval->packet_rtt_samples) {
++    if (!rtt_sample.is_reliable_for_gradient_calculation) {
++      continue;
++    }
++    float delta_packet_number =
++        static_cast<float>(rtt_sample.packet_number.ToUint64()) - gradient_x_avg;
++    float delta_rtt_sample =
++        static_cast<float>(rtt_sample.sample_rtt.ToMicroseconds()) -
++        gradient_y_avg;
++    gradient_x += delta_packet_number * delta_packet_number;
++    gradient_y += delta_packet_number * delta_rtt_sample;
++  }
++  interval_stats_.rtt_gradient = gradient_y / gradient_x;
++  interval_stats_.rtt_gradient /=
++      static_cast<float>(interval->sending_rate.TransferTime(kMaxPacketSize)
++                                               .ToMicroseconds());
++  interval_stats_.avg_rtt = gradient_y_avg;
++  interval_stats_.rtt_gradient_cut =
++      gradient_y_avg - interval_stats_.rtt_gradient * gradient_x_avg;
++}
++
++void PccUtilityManager::ComputeRttGradientError(
++    const MonitorInterval* interval) {
++  interval_stats_.rtt_gradient_error = 0.0;
++  if (interval->num_reliable_rtt_for_gradient_calculation < 2) {
++    return;
++  }
++
++  for (const PacketRttSample& rtt_sample : interval->packet_rtt_samples) {
++    if (!rtt_sample.is_reliable_for_gradient_calculation) {
++      continue;
++    }
++    float regression_rtt = static_cast<float>(rtt_sample.packet_number.ToUint64() *
++                                              interval_stats_.rtt_gradient) +
++                           interval_stats_.rtt_gradient_cut;
++    interval_stats_.rtt_gradient_error +=
++        pow(rtt_sample.sample_rtt.ToMicroseconds() - regression_rtt, 2.0);
++  }
++  interval_stats_.rtt_gradient_error /=
++      static_cast<float>(interval->num_reliable_rtt_for_gradient_calculation);
++  interval_stats_.rtt_gradient_error = sqrt(interval_stats_.rtt_gradient_error);
++  interval_stats_.rtt_gradient_error /=
++      static_cast<float>(interval_stats_.avg_rtt);
++}
++
++void PccUtilityManager::ComputeRttDeviation(const MonitorInterval* interval) {
++//  float remove;
++  float max_deviation = -1.0, fixed_avg = 0.0, sample_to_remove = 0.0, delta, cur_rtt;
++  float num_rtt = 0.0;
++  bool already_filtered = false;
++  if (interval->num_reliable_rtt < 3) {
++    interval_stats_.rtt_dev = 0;
++    return;
++  }
++
++  // Filter 1 RTT with biggest variation
++  for (const PacketRttSample& rtt_sample : interval->packet_rtt_samples) {
++    if (!rtt_sample.is_reliable) {
++      continue;
++    }
++    cur_rtt = static_cast<float>(rtt_sample.sample_rtt.ToMicroseconds());
++    fixed_avg += cur_rtt;
++    num_rtt += 1.0;
++    delta = fabs(cur_rtt - interval_stats_.avg_rtt);
++    if (delta > max_deviation) {
++	max_deviation = delta;
++	sample_to_remove = cur_rtt;
++    }
++  }
++  num_rtt -= 1.0;
++  if (num_rtt < 2.0) {
++    interval_stats_.rtt_dev = 0;
++    return;
++  }
++  fixed_avg -= sample_to_remove;
++  fixed_avg /= num_rtt;
++
++  // Calculate RTT deviation.
++  interval_stats_.rtt_dev = 0.0;
++  interval_stats_.max_rtt = -1;
++  interval_stats_.min_rtt = -1;
++  for (const PacketRttSample& rtt_sample : interval->packet_rtt_samples) {
++    if (!rtt_sample.is_reliable) {
++      continue;
++    }
++    if (already_filtered == false &&
++	    static_cast<float>(rtt_sample.sample_rtt.ToMicroseconds()) == sample_to_remove) {
++	already_filtered = true;
++	continue;
++    }
++
++    float delta_rtt_sample =
++        static_cast<float>(rtt_sample.sample_rtt.ToMicroseconds()) -
++	  fixed_avg;
++    interval_stats_.rtt_dev += delta_rtt_sample * delta_rtt_sample;
++
++    if (min_rtt_ < 0 || rtt_sample.sample_rtt.ToMicroseconds() < min_rtt_) {
++      min_rtt_ = rtt_sample.sample_rtt.ToMicroseconds();
++    }
++    if (interval_stats_.min_rtt < 0 ||
++        rtt_sample.sample_rtt.ToMicroseconds() < interval_stats_.min_rtt) {
++      interval_stats_.min_rtt =
++          static_cast<float>(rtt_sample.sample_rtt.ToMicroseconds());
++    }
++    if (interval_stats_.max_rtt < 0 ||
++        rtt_sample.sample_rtt.ToMicroseconds() > interval_stats_.max_rtt) {
++      interval_stats_.max_rtt =
++          static_cast<float>(rtt_sample.sample_rtt.ToMicroseconds());
++    }
++  }
++
++  interval_stats_.rtt_dev =
++      sqrt(interval_stats_.rtt_dev / num_rtt);
++}
++
++void PccUtilityManager::ProcessRttTrend(
++    const MonitorInterval* interval) {
++  if (interval->num_reliable_rtt < 2) {
++    return;
++  }
++
++  mi_avg_rtt_history_.emplace_back(interval_stats_.avg_rtt);
++  mi_rtt_dev_history_.emplace_back(interval_stats_.rtt_dev);
++  if (mi_avg_rtt_history_.size() > kRttHistoryLen) {
++    mi_avg_rtt_history_.pop_front();
++  }
++  if (mi_rtt_dev_history_.size() > kRttHistoryLen) {
++    mi_rtt_dev_history_.pop_front();
++  }
++
++  if (mi_avg_rtt_history_.size() >= kRttHistoryLen) {
++    ComputeTrendingGradient();
++    ComputeTrendingGradientError();
++
++    DetermineToleranceInflation();
++  }
++
++  if (mi_rtt_dev_history_.size() >= kRttHistoryLen) {
++    ComputeTrendingDeviation();
++
++    DetermineToleranceDeviation();
++  }
++}
++
++void PccUtilityManager::ComputeTrendingGradient() {
++  // Calculate RTT gradient using linear regression.
++  float gradient_x_avg = 0.0;
++  float gradient_y_avg = 0.0;
++  float gradient_x = 0.0;
++  float gradient_y = 0.0;
++  size_t num_sample = mi_avg_rtt_history_.size();
++  for (size_t i = 0; i < num_sample; ++i) {
++    gradient_x_avg += static_cast<float>(i);
++    gradient_y_avg += mi_avg_rtt_history_[i];
++  }
++  gradient_x_avg /= static_cast<float>(num_sample);
++  gradient_y_avg /= static_cast<float>(num_sample);
++  for (size_t i = 0; i < num_sample; ++i) {
++    float delta_x = static_cast<float>(i) - gradient_x_avg;
++    float delta_y = mi_avg_rtt_history_[i] - gradient_y_avg;
++    gradient_x += delta_x * delta_x;
++    gradient_y += delta_x * delta_y;
++  }
++  interval_stats_.trending_gradient = gradient_y / gradient_x;
++  interval_stats_.trending_gradient_cut =
++      gradient_y_avg - interval_stats_.trending_gradient * gradient_x_avg;
++}
++
++void PccUtilityManager::ComputeTrendingGradientError() {
++  size_t num_sample = mi_avg_rtt_history_.size();
++  interval_stats_.trending_gradient_error = 0.0;
++  for (size_t i = 0; i < num_sample; ++i) {
++    float regression_rtt =
++        static_cast<float>(i) * interval_stats_.trending_gradient +
++        interval_stats_.trending_gradient_cut;
++    interval_stats_.trending_gradient_error +=
++        pow(mi_avg_rtt_history_[i] - regression_rtt, 2.0);
++  }
++  interval_stats_.trending_gradient_error /= static_cast<float>(num_sample);
++  interval_stats_.trending_gradient_error =
++      sqrt(interval_stats_.trending_gradient_error);
++}
++
++void PccUtilityManager::ComputeTrendingDeviation() {
++  size_t num_sample = mi_rtt_dev_history_.size();
++  float avg_rtt_dev = 0.0;
++  for (size_t i = 0; i < num_sample; ++i) {
++    avg_rtt_dev += mi_rtt_dev_history_[i];
++  }
++  avg_rtt_dev /= static_cast<float>(num_sample);
++
++  interval_stats_.trending_deviation = 0.0;
++  for (size_t i = 0; i < num_sample; ++i) {
++    float delta_dev = avg_rtt_dev - mi_rtt_dev_history_[i];
++    interval_stats_.trending_deviation += (delta_dev * delta_dev);
++  }
++  interval_stats_.trending_deviation /= static_cast<float>(num_sample);
++  interval_stats_.trending_deviation = sqrt(interval_stats_.trending_deviation);
++}
++
++void PccUtilityManager::DetermineToleranceGeneral() {
++  if (interval_stats_.rtt_gradient_error <
++      std::abs(interval_stats_.rtt_gradient)) {
++    is_rtt_inflation_tolerable_ = false;
++    is_rtt_dev_tolerable_ = false;
++  } else {
++    is_rtt_inflation_tolerable_ = true;
++    is_rtt_dev_tolerable_ = true;
++  }
++}
++
++void PccUtilityManager::DetermineToleranceInflation() {
++  ratio_inflated_mi_ *= (1 - kAlpha);
++
++  if (utility_tag_ != "Scavenger" &&
++    mi_avg_rtt_history_.size() < kRttHistoryLen) {
++    return;
++  }
++
++  if (min_trending_gradient_ < 0.000001 ||
++      std::abs(interval_stats_.trending_gradient) <
++          min_trending_gradient_ / kBeta) {
++    avg_trending_gradient_ = 0.0f;
++    min_trending_gradient_ = std::abs(interval_stats_.trending_gradient);
++    dev_trending_gradient_ = std::abs(interval_stats_.trending_gradient);
++    last_trending_gradient_ = interval_stats_.trending_gradient;
++  } else {
++    float dev_gain = interval_stats_.rtt_dev < 1000
++        ? kInflationToleranceGainLow : kInflationToleranceGainHigh;
++    float tolerate_threshold_h =
++        avg_trending_gradient_ + dev_gain * dev_trending_gradient_;
++    float tolerate_threshold_l =
++        avg_trending_gradient_ - dev_gain * dev_trending_gradient_;
++    if (interval_stats_.trending_gradient < tolerate_threshold_l ||
++        interval_stats_.trending_gradient > tolerate_threshold_h) {
++      if (interval_stats_.trending_gradient > 0) {
++//        is_rtt_inflation_tolerable_ = false;
++      }
++//      is_rtt_dev_tolerable_ = false;
++      ratio_inflated_mi_ += kAlpha;
++    } else {
++      dev_trending_gradient_ =
++          dev_trending_gradient_ * (1 - kAlpha) +
++          std::abs(interval_stats_.trending_gradient -
++                   last_trending_gradient_) * kAlpha;
++      avg_trending_gradient_ =
++          avg_trending_gradient_ * (1 - kAlpha) +
++          interval_stats_.trending_gradient * kAlpha;
++      last_trending_gradient_ = interval_stats_.trending_gradient;
++    }
++
++    min_trending_gradient_ =
++        std::min(min_trending_gradient_,
++                 std::abs(interval_stats_.trending_gradient));
++  }
++
++}
++
++void PccUtilityManager::DetermineToleranceDeviation() {
++  ratio_fluctuated_mi_ *= (1 - kAlpha);
++
++  if (avg_mi_rtt_dev_ < 0.000001) {
++    avg_mi_rtt_dev_ = interval_stats_.rtt_dev;
++    dev_mi_rtt_dev_ = 0.5 * interval_stats_.rtt_dev;
++  } else {
++    if (interval_stats_.rtt_dev > avg_mi_rtt_dev_ + dev_mi_rtt_dev_ * 4.0 &&
++        interval_stats_.rtt_dev > 1000) {
++//      is_rtt_dev_tolerable_ = false;
++      ratio_fluctuated_mi_ += kAlpha;
++    } else {
++      dev_mi_rtt_dev_ =
++          dev_mi_rtt_dev_ * (1 - kAlpha) +
++          std::abs(interval_stats_.rtt_dev - avg_mi_rtt_dev_) * kAlpha;
++      avg_mi_rtt_dev_ =
++          avg_mi_rtt_dev_ * (1 - kAlpha) + interval_stats_.rtt_dev * kAlpha;
++    }
++  }
++
++  if (ratio_fluctuated_mi_ > kTrendingResetIntervalRatio) {
++    avg_mi_rtt_dev_ = -1;
++    dev_mi_rtt_dev_ = -1;
++    ratio_fluctuated_mi_ = 0;
++  }
++}
++
++float PccUtilityManager::GetHercules(float xi, float ai, float bi) {
++#define PI 3.14159265
++#define FACTOR_BOOST 1.0
++//    float xi2, yi1, yi2, hercules;
++    float xi2, yi, hercules;
++    if (ai == bi) //Avoid divide by 0
++	bi = ai + 1.0;
++    else if (bi > ai * BW_MAX_LIMIT)
++	bi = ai * BW_MAX_LIMIT;
++//    ai = ai * 0.9;
++//    ai = ai * 1.1;
++//    bi = bi * 0.9;
++    xi2 = (xi - ai) / (bi - ai);
++    yi = (FACTOR_BOOST * ((2 * xi2) - 1));
++//    yi1 = (FACTOR_BOOST * ((2 * xi2) - 1));
++//    yi2 = (FACTOR_BOOST * ((2 * xi2)));
++//    yi = (FACTOR_BOOST * xi2) - (FACTOR_BOOST / 2.0);
++//    hercules = (atan(yi1) / (PI * 2)) + (atan(yi2) / (PI * 2)) + 0.5;
++    hercules = (atan(yi) / PI) + 0.5;
++#ifdef DEBUG_PRINTS
++    std::cerr << "xi = " << xi << ", ai = " << ai << ", bi = " << bi << ", Hercules = " << hercules << std::endl;
++#endif
++    return hercules;
++}
++
++void PccUtilityManager::SetHerculesMinMaxBw(int32_t min, int32_t max) {
++    con_min_bw = min;
++    con_max_bw = max;
++}
++
++int32_t PccUtilityManager::GetHerculesMinBw() {
++    return con_min_bw;
++}
++
++int32_t PccUtilityManager::GetHerculesMaxBw() {
++    return con_max_bw;
++}
++
++}  // namespace quic
+diff --git a/quic/core/congestion_control/pcc_utility_manager.h b/quic/core/congestion_control/pcc_utility_manager.h
+new file mode 100644
+index 00000000..1843eaed
+--- /dev/null
++++ b/quic/core/congestion_control/pcc_utility_manager.h
+@@ -0,0 +1,158 @@
++#ifndef THIRD_PARTY_PCC_QUIC_PCC_UTILITY_MANAGER_H_
++#define THIRD_PARTY_PCC_QUIC_PCC_UTILITY_MANAGER_H_
++
++#include "quic/core/congestion_control/pcc_monitor_interval_queue.h"
++
++#include <string>
++
++namespace quic {
++
++// IntervalStats stores the performance metrics for a monitor interval, which
++// is used for utility calculation.
++struct IntervalStats {
++  IntervalStats() : min_rtt(-1), max_rtt(-1) {}
++  ~IntervalStats() {}
++
++  float interval_duration;
++  float rtt_ratio;
++  int64_t marked_lost_bytes;
++  float loss_rate;
++  float actual_sending_rate_mbps;
++  float ack_rate_mbps;
++
++  float avg_rtt;
++  float rtt_dev;
++  float min_rtt;
++  float max_rtt;
++  float approx_rtt_gradient;
++
++  float rtt_gradient;
++  float rtt_gradient_cut;
++  float rtt_gradient_error;
++
++  float trending_gradient;
++  float trending_gradient_cut;
++  float trending_gradient_error;
++
++  float trending_deviation;
++};
++
++class PccUtilityManager {
++ public:
++  PccUtilityManager();
++
++  // Utility calculation interface for all pcc senders.
++  float CalculateUtility(const MonitorInterval* interval,
++                         QuicTime::Delta event_time);
++
++  // Get the utility function used by pcc sender.
++  const std::string GetUtilityTag() const;
++  // Get the effective utility tag.
++  const std::string GetEffectiveUtilityTag() const;
++  // Set the utility function used by pcc sender.
++  void SetUtilityTag(std::string utility_tag);
++  // Set the effective utility tag.
++  void SetEffectiveUtilityTag(std::string utility_tag);
++  // Set the parameter needed by utility function.
++  void SetUtilityParameter(void* param);
++  // Get the specified utility parameter.
++  void* GetUtilityParameter(unsigned long parameter_index) const;
++  float GetAvgAckRate() { return avg_ack_rate_mbps_;}
++  static void SetHerculesMinMaxBw(int32_t min, int32_t max);
++  static int32_t GetHerculesMinBw();
++  static int32_t GetHerculesMaxBw();
++
++ private:
++  // Prepare performance metrics for utility calculation.
++  void PrepareStatistics(const MonitorInterval* interval);
++  void PreProcessing(const MonitorInterval* interval);
++  void ComputeSimpleMetrics(const MonitorInterval* interval);
++  void ComputeApproxRttGradient(const MonitorInterval* interval);
++  void ComputeRttGradient(const MonitorInterval* interval);
++  void ComputeRttGradientError(const MonitorInterval*);
++  void ComputeRttDeviation(const MonitorInterval* interval);
++
++  void ProcessRttTrend(const MonitorInterval* interval);
++  void ComputeTrendingGradient();
++  void ComputeTrendingGradientError();
++  void ComputeTrendingDeviation();
++
++  void DetermineToleranceGeneral();
++  void DetermineToleranceInflation();
++  void DetermineToleranceDeviation();
++
++  // Calculates utility for |interval|.
++  float CalculateUtilityAllegro(const MonitorInterval* interval);
++  float CalculateUtilityVivace(const MonitorInterval* interval);
++  float CalculateUtilityHercules(const MonitorInterval* interval);
++  float CalculateUtilityHybridAllegro(const MonitorInterval* interval,
++                                      float bound);
++  float CalculateUtilityProportional(const MonitorInterval* interval,
++                                  float latency_coefficient,
++                                  float loss_coefficient);
++  float CalculateUtilityScavenger(const MonitorInterval* interval,
++                                   float rtt_variance_coefficient,
++				   float latency_coefficience);
++  float CalculateUtilityHybridVivace(const MonitorInterval* interval,
++                                     float bound);
++  float CalculateUtilityHybridVivace2(const MonitorInterval* interval,
++                                      float bound);
++  float CalculateUtilityRateLimiter(const MonitorInterval* interval,
++                                    float rate_limiter_parameter);
++  float CalculateUtilityLedbat(const MonitorInterval* interval,
++                               float target_delay);
++  float CalculateUtilityHybrid(const MonitorInterval* interval,
++                               float rate_bound);
++  float CalculateUtilityTEST(const MonitorInterval* interval,
++                             float latency_coefficient,
++                             float loss_coefficient);
++
++  // Calculates perfect utility with respect to a specifc sending rate, i.e.,
++  // assuming no packet loss and no RTT changes.
++  float CalculatePerfectUtilityAllegro(float sending_rate_mbps);
++  float CalculatePerfectUtilityVivace(float sending_rate_mbps);
++
++  //Calculate Hercules algorithm
++  float GetHercules(float xi, float ai, float bi);
++  // String tag that represents the utility function.
++  std::string utility_tag_;
++  // May be different from actual utility tag when using Hybrid utility.
++  std::string effective_utility_tag_;
++  // Parameters needed by some utility functions, e.g., sending rate bound used
++  // in hybrid utility functions.
++  std::vector<void *> utility_parameters_;
++
++  // Performance metrics for latest monitor interval.
++  IntervalStats interval_stats_;
++
++  size_t lost_bytes_tolerance_quota_;
++
++  float avg_mi_rtt_dev_;
++  float dev_mi_rtt_dev_;
++  float min_rtt_;
++
++  std::deque<float> mi_avg_rtt_history_;
++  float avg_trending_gradient_;
++  float min_trending_gradient_;
++  float dev_trending_gradient_;
++  float last_trending_gradient_;
++
++  std::deque<float> mi_rtt_dev_history_;
++  float avg_trending_dev_;
++  float min_trending_dev_;
++  float dev_trending_dev_;
++  float last_trending_dev_;
++
++  float ratio_inflated_mi_;
++  float ratio_fluctuated_mi_;
++
++  bool is_rtt_inflation_tolerable_;
++  bool is_rtt_dev_tolerable_;
++
++  float avg_ack_rate_mbps_;
++};
++
++#define MEGA 1000000.0
++}  // namespace quic
++
++#endif
+diff --git a/quic/core/congestion_control/pcc_vivace_sender.cc b/quic/core/congestion_control/pcc_vivace_sender.cc
+new file mode 100644
+index 00000000..3adb15e4
+--- /dev/null
++++ b/quic/core/congestion_control/pcc_vivace_sender.cc
+@@ -0,0 +1,429 @@
++#include "pcc_vivace_sender.h"
++
++#include <assert.h>
++#include <iostream>
++
++#include <algorithm>
++
++namespace quic {
++
++namespace {
++// Number of bits per Mbit.
++const size_t kMegabit = 1024 * 1024;
++// Step size for rate change in PROBING mode.
++const float kProbingStepSize = 0.05f;
++// The factor that converts utility gradient to sending rate change.
++float kUtilityGradientToRateChangeFactor = 1.0f;
++// The exponent to amplify sending rate change based on number of consecutive
++// rounds in DECISION_MADE mode.
++float kRateChangeAmplifyExponent = 1.2f;
++static bool FLAGS_restore_central_rate_upon_app_limited =  false;
++
++// The initial maximum rate change step size in Vivace.
++float kInitialMaxStepSize = 0.05f;
++// The incremental rate change step size allowed on basis of current maximum
++// step size every time the calculated rate change exceeds the current max.
++float kIncrementalStepSize = 0.05;
++// The smallest sending rate change allowed by Vivace.
++const QuicBandwidth kMinRateChange = QuicBandwidth::FromKBitsPerSecond(1);
++// The smallest sending rate supported by Vivace.
++const QuicBandwidth kMinSendingRate = QuicBandwidth::FromKBitsPerSecond(5);
++
++const float kMinRateChangeFactor = 0.01;
++}
++
++
++PccVivaceSender::PccVivaceSender(const RttStats* rtt_stats,
++                                 QuicPacketCount initial_congestion_window,
++                                 QuicPacketCount max_congestion_window,
++                                 QuicRandom* random,
++				 bool is_vivace)
++    : PccSender(rtt_stats,
++                //unacked_packets,
++                initial_congestion_window,
++                max_congestion_window,
++                random),
++      latest_utility_info_(QuicBandwidth::Zero(), 0.0),
++      incremental_rate_change_step_allowance_(0) {
++	   if (is_vivace) {
++	       SetUtilityTag("Vivace");
++	       min_bw_valid_ = max_bw_valid_ = false;
++	       std::cout << "Starting congestion control: PCC Vivace\n";
++          } else {
++	      SetUtilityTag("Hercules");
++	      if (sending_rate_ > min_bw_ && min_bw_valid_) {
++		  sending_rate_ = min_bw_;
++	      }
++	      std::cout << "Starting congestion control: PCC Hercules\n";
++	  }
++//	float RttVarCoEff = 0.0015;
++//	SetUtilityTag("Scavenger");
++//	SetUtilityParameter(&RttVarCoEff);
++//      std::cout << "Starting congestion control: PCC Vivace scavanger\n";
++}
++
++QuicBandwidth PccVivaceSender::GetSendingRateForNonUsefulInterval() const {
++  return sending_rate_;
++}
++
++void PccVivaceSender::OnUtilityAvailable(
++    const std::vector<const MonitorInterval *>& useful_intervals,
++    QuicTime event_time) {
++  // Calculate the utilities for all available intervals.
++  std::vector<UtilityInfo> utility_info;
++  for(size_t i = 0; i < useful_intervals.size(); ++i) {
++#ifdef DEBUG_PRINTS
++      std::cerr << "Round " << i+1 << ": bit rate: "
++	  << useful_intervals[i]->sending_rate.ToBitsPerSecond()
++	  << ". Results:\n";
++#endif
++    double utility = utility_manager_.CalculateUtility(
++                        useful_intervals[i], event_time - conn_start_time_);
++    utility_info.push_back(
++        UtilityInfo(useful_intervals[i]->sending_rate, utility));
++#ifdef DEBUG_PRINTS
++    std::cerr << "End MI (rate: "
++              << useful_intervals[i]->sending_rate.ToKBitsPerSecond()
++              << ", rtt "
++              << useful_intervals[i]->rtt_on_monitor_start.ToMicroseconds()
++              << "->"
++              << useful_intervals[i]->rtt_on_monitor_end.ToMicroseconds()
++              << ", " << incremental_rate_change_step_allowance_
++              << ", " << useful_intervals[i]->bytes_acked << "/"
++              << useful_intervals[i]->bytes_sent << ") with utility "
++              << utility
++              << "(latest " << latest_utility_info_.utility << ")" << std::endl;
++#endif
++  }
++
++  switch (mode_) {
++    case STARTING:
++	{
++	    QuicBandwidth limited_max = max_bw_;
++	    if (limited_max > min_bw_ * BW_MAX_LIMIT && min_bw_valid_)
++		limited_max = min_bw_* BW_MAX_LIMIT;
++	    assert(utility_info.size() == 1u);
++	    if (utility_info[0].utility > latest_utility_info_.utility && (sending_rate_ < limited_max || !max_bw_valid_)) {
++		// Stay in STARTING mode. Double the sending rate and update
++		// latest_utility.
++		prev_sending_rate_ = sending_rate_;
++		sending_rate_ = sending_rate_ * 2;
++		if (sending_rate_ > limited_max && max_bw_valid_)
++		    sending_rate_ = limited_max;
++#ifdef DEBUG_PRINTS
++		std::cerr << "Rate decision after test: " << sending_rate_ << std::endl;
++#endif
++		latest_utility_info_ = utility_info[0];
++		++rounds_;
++	    } else {
++		if (utility_info[0].utility > latest_utility_info_.utility) {
++		    prev_sending_rate_ = limited_max;
++		}
++		// Enter PROBING mode if utility decreases.
++		PccSender::EnterProbing();
++	    }
++	}
++	break;
++    case PROBING:
++      if (CanMakeDecision(utility_info)) {
++        if (FLAGS_restore_central_rate_upon_app_limited &&
++            interval_queue_.current().is_useful) {
++          // If there is no non-useful interval in this round of PROBING, sender
++          // needs to change sending_rate_ back to central rate.
++          RestoreCentralSendingRate();
++        }
++        assert(utility_info.size() == 2 * GetNumIntervalGroupsInProbing());
++        // Enter DECISION_MADE mode if a decision is made.
++        SetRateChangeDirection(utility_info);
++	if (direction_ == DECREASE) {
++	    //Recalculate utility for old low value which changed to be the high value
++	    int size = useful_intervals.size();
++	    MonitorInterval mi1 = *useful_intervals[size - 1],  mi2 = *useful_intervals[size - 2];
++	    MonitorInterval *mip = &(mi1.sending_rate < mi2.sending_rate? mi1: mi2);
++	    mip->is_increase = 1;
++	    mip->do_rttdev_dec = true;
++	    latest_utility_info_.utility = utility_manager_.CalculateUtility(
++                        mip, event_time - conn_start_time_);
++	    latest_utility_info_.sending_rate = mip->sending_rate;
++#ifdef DEBUG_PRINTS
++	    std::cout << "Utility recalculated (low rate become high!), new utility: "
++		<< latest_utility_info_.utility << std::endl;
++#endif
++	}
++	if (direction_ == INCREASE && sending_rate_ >= max_bw_ && max_bw_valid_) {
++	    sending_rate_ = max_bw_;
++	    PccSender::EnterProbing();
++	}else
++	    EnterDecisionMade(utility_info);
++      } else {
++        PccSender::EnterProbing();
++      }
++      if ((rounds_ > 1 || mode_ == DECISION_MADE) && sending_rate_ <= kMinSendingRate) {
++        sending_rate_ = kMinSendingRate;
++        incremental_rate_change_step_allowance_ = 0;
++        rounds_ = 1;
++        mode_ = STARTING;
++      }
++      break;
++    case DECISION_MADE:
++      assert(utility_info.size() == 1u);
++      if ((direction_ == INCREASE &&
++           utility_info[0].utility > latest_utility_info_.utility &&
++           utility_info[0].sending_rate > latest_utility_info_.sending_rate) ||
++          (direction_ == INCREASE &&
++           utility_info[0].utility < latest_utility_info_.utility &&
++           utility_info[0].sending_rate < latest_utility_info_.sending_rate) ||
++          (direction_ == DECREASE &&
++           utility_info[0].utility > latest_utility_info_.utility &&
++           utility_info[0].sending_rate < latest_utility_info_.sending_rate) ||
++          (direction_ == DECREASE &&
++           utility_info[0].utility < latest_utility_info_.utility &&
++           utility_info[0].sending_rate > latest_utility_info_.sending_rate)) {
++        // Remain in DECISION_MADE mode. Keep increasing or decreasing the
++        // sending rate.
++        EnterDecisionMade(utility_info);
++        latest_utility_info_ = utility_info[0];
++	if (direction_ == DECREASE) {
++	    MonitorInterval mi = *useful_intervals[0];
++	    mi.is_increase = true;
++	    mi.do_rttdev_dec = true;
++	    latest_utility_info_.utility = utility_manager_.CalculateUtility(
++                        &mi, event_time - conn_start_time_);
++/*	    std::cout << "Utility recalculated (low rate become high!), new utility: "
++		<< latest_utility_info_.utility << std::endl;*/
++	}
++      } else {
++        // Enter PROBING mode if utility decreases.
++        EnterProbing(utility_info);
++      }
++      break;
++  }
++}
++
++bool PccVivaceSender::CanMakeDecision(
++    const std::vector<UtilityInfo>& utility_info) const {
++  if (utility_info.size() < 2 * GetNumIntervalGroupsInProbing()) {
++    return false;
++  }
++
++  size_t count_increase = 0;
++  size_t count_decrease = 0;
++  size_t interval_groups = GetNumIntervalGroupsInProbing();
++  for (size_t i = 0; i < interval_groups; ++i) {
++    bool increase_i =
++        utility_info[2 * i].utility > utility_info[2 * i + 1].utility
++            ? utility_info[2 * i].sending_rate >
++                  utility_info[2 * i + 1].sending_rate
++            : utility_info[2 * i].sending_rate <
++                  utility_info[2 * i + 1].sending_rate;
++
++    if (increase_i) {
++      count_increase++;
++    } else {
++      count_decrease++;
++    }
++  }
++
++  /*return utility_manager_.GetEffectiveUtilityTag() != "Scavenger"
++      ? (count_increase > GetNumIntervalGroupsInProbing() / 2 ||
++         count_decrease == GetNumIntervalGroupsInProbing())
++      : (count_decrease > GetNumIntervalGroupsInProbing() / 2 ||
++         count_increase == GetNumIntervalGroupsInProbing());*/
++  return count_increase > interval_groups / 2 || count_decrease > interval_groups / 2;
++}
++
++void PccVivaceSender::SetRateChangeDirection(
++    const std::vector<UtilityInfo>& utility_info) {
++  size_t count_increase = 0;
++  size_t count_decrease = 0;
++  for (size_t i = 0; i < GetNumIntervalGroupsInProbing(); ++i) {
++    bool increase_i =
++        utility_info[2 * i].utility > utility_info[2 * i + 1].utility
++            ? utility_info[2 * i].sending_rate >
++                  utility_info[2 * i + 1].sending_rate
++            : utility_info[2 * i].sending_rate <
++                  utility_info[2 * i + 1].sending_rate;
++
++    if (increase_i) {
++      count_increase++;
++    } else {
++      count_decrease++;
++    }
++  }
++
++  direction_ = count_increase > count_decrease ? INCREASE : DECREASE;
++
++  // Store latest utility in the meanwhile.
++  for (size_t i = 0; i < GetNumIntervalGroupsInProbing(); ++i) {
++    bool increase_i =
++        utility_info[2 * i].utility > utility_info[2 * i + 1].utility
++            ? utility_info[2 * i].sending_rate >
++                  utility_info[2 * i + 1].sending_rate
++            : utility_info[2 * i].sending_rate <
++                  utility_info[2 * i + 1].sending_rate;
++
++    if ((increase_i && direction_ == INCREASE) ||
++        (!increase_i && direction_ == DECREASE)) {
++      latest_utility_info_ =
++          utility_info[2 * i].utility > utility_info[2 * i + 1].utility
++              ? utility_info[2 * i]
++              : utility_info[2 * i + 1];
++    }
++  }
++}
++
++void PccVivaceSender::EnterProbing(
++    const std::vector<UtilityInfo>& utility_info) {
++  assert(DECISION_MADE == mode_);
++  rounds_ = 1;
++
++/*  QuicBandwidth rate_change = ComputeRateChange(utility_info);
++  if (direction_ == INCREASE) {
++    sending_rate_ = sending_rate_ - rate_change;
++  } else {
++    sending_rate_ = sending_rate_ + rate_change;
++  }*/
++  sending_rate_ = prev_sending_rate_;
++
++  if (sending_rate_ < kMinSendingRate) {
++    sending_rate_ = kMinSendingRate;
++    incremental_rate_change_step_allowance_ = 0;
++  }
++  mode_ = PROBING;
++#ifdef DEBUG_PRINTS
++  std::cerr << "PccVivaceSender::EnterProbing: Rate decision: " << sending_rate_ << std::endl;
++#endif
++
++  if (utility_manager_.GetUtilityTag() == "Hybrid") {
++    std::string effective_utility_tag = "Hybrid";
++    float higher_probing_rate_mbps = static_cast<float>(
++            (sending_rate_ * (1 + kProbingStepSize)).ToBitsPerSecond()) /
++        static_cast<float>(kMegabit);
++    float hybrid_switching_rate_mbps =
++        *(float *)utility_manager_.GetUtilityParameter(0);
++    if (higher_probing_rate_mbps > hybrid_switching_rate_mbps) {
++      effective_utility_tag = "Scavenger";
++    }
++    utility_manager_.SetEffectiveUtilityTag(effective_utility_tag);
++  }
++}
++
++void PccVivaceSender::EnterDecisionMade(
++    const std::vector<UtilityInfo>& utility_info) {
++  if (mode_ == PROBING) {
++    sending_rate_ = direction_ == INCREASE
++        ? sending_rate_ * (1 + kProbingStepSize)
++        : sending_rate_ * (1 - kProbingStepSize);
++  }
++#ifdef DEBUG_PRINTS
++  std::cerr << "EnterDecisionMade: Rate decision: " << sending_rate_ << std::endl;
++#endif
++  prev_sending_rate_ = sending_rate_;
++
++  rounds_ = mode_ == PROBING ? 1 : rounds_ + 1;
++
++  QuicBandwidth rate_change = ComputeRateChange(utility_info);
++  if (direction_ == INCREASE) {
++    sending_rate_ = sending_rate_ + rate_change;
++  } else {
++    sending_rate_ = sending_rate_ - rate_change;
++  }
++
++  if (sending_rate_ >= max_bw_ && max_bw_valid_) {
++    sending_rate_ = max_bw_;
++    mode_ = PROBING;
++    rounds_ = 1;
++    incremental_rate_change_step_allowance_ = 0;
++  } else if (sending_rate_ < kMinSendingRate) {
++    sending_rate_ = kMinSendingRate;
++    mode_ = PROBING;
++    rounds_ = 1;
++    incremental_rate_change_step_allowance_ = 0;
++  } else {
++    mode_ = DECISION_MADE;
++  }
++}
++
++QuicBandwidth PccVivaceSender::ComputeRateChange(
++    const std::vector<UtilityInfo>& utility_info) {
++  assert(mode_ != STARTING);
++
++  // Compute rate difference between higher and lower sending rate, as well as
++  // their utility difference.
++  QuicBandwidth delta_sending_rate = QuicBandwidth::Zero();
++  float delta_utility = 0.0;
++  if (mode_ == PROBING) {
++    delta_sending_rate =
++        std::max(utility_info[0].sending_rate, utility_info[1].sending_rate) -
++        std::min(utility_info[0].sending_rate, utility_info[1].sending_rate);
++
++    for (size_t i = 0; i < GetNumIntervalGroupsInProbing(); ++i) {
++      bool increase_i =
++          utility_info[2 * i].utility > utility_info[2 * i + 1].utility
++              ? utility_info[2 * i].sending_rate >
++                    utility_info[2 * i + 1].sending_rate
++              : utility_info[2 * i].sending_rate <
++                    utility_info[2 * i + 1].sending_rate;
++      if ((increase_i && direction_ == DECREASE) ||
++          (!increase_i && direction_ == INCREASE)) {
++        continue;
++      }
++
++      delta_utility = delta_utility +
++          std::max(utility_info[2 * i].utility,
++                   utility_info[2 * i + 1].utility) -
++          std::min(utility_info[2 * i].utility,
++                   utility_info[2 * i + 1].utility);
++    }
++    delta_utility /= static_cast<float>(GetNumIntervalGroupsInProbing());
++  } else {
++    delta_sending_rate =
++        std::max(utility_info[0].sending_rate,
++                 latest_utility_info_.sending_rate) -
++        std::min(utility_info[0].sending_rate,
++                 latest_utility_info_.sending_rate);
++    delta_utility =
++        std::max(utility_info[0].utility, latest_utility_info_.utility) -
++        std::min(utility_info[0].utility, latest_utility_info_.utility);
++  }
++
++  assert(!delta_sending_rate.IsZero());
++
++  float utility_gradient =
++      kMegabit * delta_utility / delta_sending_rate.ToBitsPerSecond();
++  QuicBandwidth rate_change = QuicBandwidth::FromBitsPerSecond(
++      utility_gradient * kMegabit * kUtilityGradientToRateChangeFactor);
++  if (mode_ == DECISION_MADE) {
++    // Amplify rate change amount when sending rate changes towards the same
++    // direction more than once.
++    rate_change = rate_change * pow(static_cast<float>((rounds_ + 1) / 2),
++                                    kRateChangeAmplifyExponent);
++  } else {
++    // Reset allowed incremental rate change step size upon entering PROBING.
++    incremental_rate_change_step_allowance_ = 0;
++  }
++
++  QuicBandwidth max_allowed_rate_change =
++      sending_rate_ * (kInitialMaxStepSize +
++                       kIncrementalStepSize * static_cast<float>(
++                           incremental_rate_change_step_allowance_));
++  if (rate_change > max_allowed_rate_change) {
++    rate_change = max_allowed_rate_change;
++    // Increase incremental rate change step size if the calculated rate change
++    // exceeds the current maximum.
++    incremental_rate_change_step_allowance_++;
++  } else if (incremental_rate_change_step_allowance_ > 0) {
++    // Reduce incremental rate change allowance if calculated rate is smaller
++    // than the current maximum.
++    incremental_rate_change_step_allowance_--;
++  }
++
++  QuicBandwidth min_change = QuicBandwidth::FromBitsPerSecond(
++              static_cast<uint64_t>(utility_info[0].sending_rate.ToBitsPerSecond() * kMinRateChangeFactor));
++  if (rate_change < min_change)
++      rate_change = min_change;
++
++  return std::max(rate_change, kMinRateChange);
++}
++
++}  // namespace quic
+diff --git a/quic/core/congestion_control/pcc_vivace_sender.h b/quic/core/congestion_control/pcc_vivace_sender.h
+new file mode 100644
+index 00000000..979d96e2
+--- /dev/null
++++ b/quic/core/congestion_control/pcc_vivace_sender.h
+@@ -0,0 +1,48 @@
++#ifndef PCC_VIVACE_SENDER_H_
++#define PCC_VIVACE_SENDER_H_
++
++#include "quic/core/congestion_control/pcc_sender.h"
++
++namespace quic {
++
++class PccVivaceSender : public PccSender {
++ public:
++  PccVivaceSender(const RttStats* rtt_stats,
++                  //const QuicUnackedPacketMap* unacked_packets,
++                  QuicPacketCount initial_congestion_window,
++                  QuicPacketCount max_congestion_window, QuicRandom* random,
++		  bool isVivace);
++  PccVivaceSender(const PccVivaceSender&) = delete;
++  PccVivaceSender& operator=(const PccVivaceSender&) = delete;
++  PccVivaceSender(PccVivaceSender&&) = delete;
++  PccVivaceSender& operator=(PccVivaceSender&&) = delete;
++  ~PccVivaceSender() /*override*/ {}
++
++  QuicBandwidth GetSendingRateForNonUsefulInterval() const override;
++
++  void OnUtilityAvailable(
++      const std::vector<const MonitorInterval *>& useful_intervals,
++      QuicTime event_time) override;
++
++ private:
++  bool CanMakeDecision(
++      const std::vector<UtilityInfo>& utility_info) const override;
++  // Determine rate change direction in PROBING mode based on the utilities of
++  // a majority of interval groups.
++  void SetRateChangeDirection(const std::vector<UtilityInfo>& utility_info);
++
++  void EnterProbing(const std::vector<UtilityInfo>& utility_info);
++  void EnterDecisionMade(const std::vector<UtilityInfo>& utility_info);
++  QuicBandwidth ComputeRateChange(const std::vector<UtilityInfo>& utility_info);
++
++  // Most recent utility info used when making the last rate change decision.
++  UtilityInfo latest_utility_info_;
++
++  // Number of incremental rate change step size allowed on basis of initial
++  // maximum rate change step size.
++  size_t incremental_rate_change_step_allowance_;
++};
++
++}  // namespace quic
++
++#endif
+diff --git a/quic/core/congestion_control/send_algorithm_interface.cc b/quic/core/congestion_control/send_algorithm_interface.cc
+index 22f164cd..3f04acd5 100644
+--- a/quic/core/congestion_control/send_algorithm_interface.cc
++++ b/quic/core/congestion_control/send_algorithm_interface.cc
+@@ -8,6 +8,8 @@
+ #include "quic/core/congestion_control/bbr2_sender.h"
+ #include "quic/core/congestion_control/bbr_sender.h"
+ #include "quic/core/congestion_control/tcp_cubic_sender_bytes.h"
++#include "quic/core/congestion_control/pcc_sender.h"
++#include "quic/core/congestion_control/pcc_vivace_sender.h"
+ #include "quic/core/quic_packets.h"
+ #include "quic/platform/api/quic_bug_tracker.h"
+ #include "quic/platform/api/quic_flag_utils.h"
+@@ -44,8 +46,14 @@ SendAlgorithmInterface* SendAlgorithmInterface::Create(
+               ? static_cast<BbrSender*>(old_send_algorithm)
+               : nullptr);
+     case kPCC:
+-      // PCC is currently not supported, fall back to CUBIC instead.
+-      ABSL_FALLTHROUGH_INTENDED;
++    case kPccVV:
++      // PCC is currently not supported, fall back to CUBIC instead. Added PCC
++//      ABSL_FALLTHROUGH_INTENDED;
++//      return new PccSender(
++      return new PccVivaceSender(
++	      rtt_stats, initial_congestion_window,
++	      max_congestion_window, random,
++	      congestion_control_type == kPccVV);
+     case kCubicBytes:
+       return new TcpCubicSenderBytes(
+           clock, rtt_stats, false /* don't use Reno */,
+diff --git a/quic/core/congestion_control/send_algorithm_test.cc b/quic/core/congestion_control/send_algorithm_test.cc
+index d4c60706..230d18f5 100644
+--- a/quic/core/congestion_control/send_algorithm_test.cc
++++ b/quic/core/congestion_control/send_algorithm_test.cc
+@@ -112,6 +112,8 @@ const char* CongestionControlTypeToString(CongestionControlType cc_type) {
+       return "BBR";
+     case kPCC:
+       return "PCC";
++    case kPccVV:
++      return "PCC_VIVACE";
+     default:
+       QUIC_DLOG(FATAL) << "Unexpected CongestionControlType";
+       return nullptr;
+@@ -142,7 +144,7 @@ std::string TestParamToString(
+ std::vector<TestParams> GetTestParams() {
+   std::vector<TestParams> params;
+   for (const CongestionControlType congestion_control_type :
+-       {kBBR, kCubicBytes, kRenoBytes, kPCC}) {
++       {kBBR, kCubicBytes, kRenoBytes, kPCC, kPccVV}) {
+     params.push_back(TestParams(congestion_control_type));
+   }
+   return params;
+diff --git a/quic/core/congestion_control/tcp_cubic_sender_bytes.cc b/quic/core/congestion_control/tcp_cubic_sender_bytes.cc
+index 562da98c..1944a24c 100644
+--- a/quic/core/congestion_control/tcp_cubic_sender_bytes.cc
++++ b/quic/core/congestion_control/tcp_cubic_sender_bytes.cc
+@@ -52,7 +52,9 @@ TcpCubicSenderBytes::TcpCubicSenderBytes(
+                                      kDefaultTCPMSS),
+       initial_max_tcp_congestion_window_(max_congestion_window *
+                                          kDefaultTCPMSS),
+-      min_slow_start_exit_window_(min_congestion_window_) {}
++      min_slow_start_exit_window_(min_congestion_window_) {
++	  std::cout << "Starting congestion control: " << (reno? "Reno": "Cubic") << '\n';
++      }
+ 
+ TcpCubicSenderBytes::~TcpCubicSenderBytes() {}
+ 
+diff --git a/quic/core/crypto/crypto_protocol.h b/quic/core/crypto/crypto_protocol.h
+index 5a300386..3124058d 100644
+--- a/quic/core/crypto/crypto_protocol.h
++++ b/quic/core/crypto/crypto_protocol.h
+@@ -125,8 +125,10 @@ const QuicTag kBBQ0 = TAG('B', 'B', 'Q', '0');   // Increase bytes_acked in
+                                                  // PROBE_UP when app limited.
+                                                  // bw_lo * bytes_lost/cwnd
+ const QuicTag kRENO = TAG('R', 'E', 'N', 'O');   // Reno Congestion Control
+-const QuicTag kTPCC = TAG('P', 'C', 'C', '\0');  // Performance-Oriented
++const QuicTag kTPCC = TAG('T', 'P', 'C', 'C');  // Performance-Oriented
+                                                  // Congestion Control
++const QuicTag kVPCC = TAG('V', 'P', 'C', 'C');  // Performance-Oriented
++                                                 // Congestion Control - Vivace flavour
+ const QuicTag kBYTE = TAG('B', 'Y', 'T', 'E');   // TCP cubic or reno in bytes
+ const QuicTag kIW03 = TAG('I', 'W', '0', '3');   // Force ICWND to 3
+ const QuicTag kIW10 = TAG('I', 'W', '1', '0');   // Force ICWND to 10
+diff --git a/quic/core/quic_connection.h b/quic/core/quic_connection.h
+index 1ec7c7e7..d495ac24 100644
+--- a/quic/core/quic_connection.h
++++ b/quic/core/quic_connection.h
+@@ -1259,6 +1259,8 @@ class QUIC_EXPORT_PRIVATE QuicConnection
+     context_.tracer.swap(tracer);
+   }
+ 
++  QuicArenaScopedPtr<QuicAlarm> & SendAlarm() { return send_alarm_; }
++
+  protected:
+   // Calls cancel() on all the alarms owned by this connection.
+   void CancelAllAlarms();
+diff --git a/quic/core/quic_flags_list.h b/quic/core/quic_flags_list.h
+index d625fd0c..c507645f 100644
+--- a/quic/core/quic_flags_list.h
++++ b/quic/core/quic_flags_list.h
+@@ -40,7 +40,7 @@ QUIC_FLAG(FLAGS_quic_reloadable_flag_quic_accept_empty_crypto_frame, false)
+ // If true, ack frequency frame can be sent from server to client.
+ QUIC_FLAG(FLAGS_quic_reloadable_flag_quic_can_send_ack_frequency, true)
+ // If true, allow client to enable BBRv2 on server via connection option \'B2ON\'.
+-QUIC_FLAG(FLAGS_quic_reloadable_flag_quic_allow_client_enabled_bbr_v2, false)
++QUIC_FLAG(FLAGS_quic_reloadable_flag_quic_allow_client_enabled_bbr_v2, true)
+ // If true, always starts a new ack aggregation epoch if a full round has passed since the start of the current epoch.
+ QUIC_FLAG(FLAGS_quic_reloadable_flag_quic_bbr_start_new_aggregation_epoch_after_a_full_round, true)
+ // If true, change QuicCryptoServerStream::FinishProcessingHandshakeMessageAfterProcessClientHello to noop if connection is disconnected.
+diff --git a/quic/core/quic_protocol_flags_list.h b/quic/core/quic_protocol_flags_list.h
+index 3e327139..e37821e9 100644
+--- a/quic/core/quic_protocol_flags_list.h
++++ b/quic/core/quic_protocol_flags_list.h
+@@ -98,7 +98,8 @@ QUIC_PROTOCOL_FLAG(
+     "during pacing.")
+ 
+ QUIC_PROTOCOL_FLAG(
+-    int32_t, quic_lumpy_pacing_min_bandwidth_kbps, 1200,
++//    int32_t, quic_lumpy_pacing_min_bandwidth_kbps, 1200,
++    int32_t, quic_lumpy_pacing_min_bandwidth_kbps, 2500,
+     "The minimum estimated client bandwidth below which the pacing sender will "
+     "not allow bursts.")
+ 
+diff --git a/quic/core/quic_sent_packet_manager.cc b/quic/core/quic_sent_packet_manager.cc
+index 4c5026ca..27f03972 100644
+--- a/quic/core/quic_sent_packet_manager.cc
++++ b/quic/core/quic_sent_packet_manager.cc
+@@ -260,6 +260,12 @@ void QuicSentPacketManager::SetFromConfig(const QuicConfig& config) {
+               config.HasClientRequestedIndependentOption(kQBIC, perspective))) {
+     SetSendAlgorithm(kCubicBytes);
+   }
++  if (config.HasClientRequestedIndependentOption(kTPCC, perspective)) {
++    SetSendAlgorithm(kPCC);
++  }
++  if (config.HasClientRequestedIndependentOption(kVPCC, perspective)) {
++    SetSendAlgorithm(kPccVV);
++  }
+ 
+   // Initial window.
+   if (GetQuicReloadableFlag(quic_unified_iw_options)) {
+@@ -365,6 +371,10 @@ void QuicSentPacketManager::ApplyConnectionOptions(
+     cc_type = kRenoBytes;
+   } else if (ContainsQuicTag(connection_options, kQBIC)) {
+     cc_type = kCubicBytes;
++  } else if (ContainsQuicTag(connection_options, kTPCC)) {
++    cc_type = kPCC;
++  } else if (ContainsQuicTag(connection_options, kVPCC)) {
++    cc_type = kPccVV;
+   }
+ 
+   if (cc_type.has_value()) {
+diff --git a/quic/core/quic_session.cc b/quic/core/quic_session.cc
+index 4664a441..1b97bdbc 100644
+--- a/quic/core/quic_session.cc
++++ b/quic/core/quic_session.cc
+@@ -27,8 +27,10 @@
+ #include "quic/platform/api/quic_server_stats.h"
+ #include "quic/platform/api/quic_stack_trace.h"
+ #include "common/quiche_text_utils.h"
++#include "quic/core/congestion_control/pcc_utility_manager.h"
+ 
+ using spdy::SpdyPriority;
++int32_t pcc_max_bw = 0;
+ 
+ namespace quic {
+ 
+@@ -59,6 +61,9 @@ class ClosedStreamsCleanUpDelegate : public QuicAlarm::Delegate {
+ #define ENDPOINT \
+   (perspective() == Perspective::IS_SERVER ? "Server: " : "Client: ")
+ 
++#define TIME_SLOT_MS 100
++#define TS_IN_SECOND 10
++
+ QuicSession::QuicSession(
+     QuicConnection* connection, Visitor* owner, const QuicConfig& config,
+     const ParsedQuicVersionVector& supported_versions,
+@@ -107,7 +112,19 @@ QuicSession::QuicSession(
+       supported_versions_(supported_versions),
+       is_configured_(false),
+       was_zero_rtt_rejected_(false),
+-      liveness_testing_in_progress_(false) {
++      liveness_testing_in_progress_(false),
++      stream_send_part_(0.0),
++      available_bw_state_(BANDWITH_NOT_INITIALIZED),
++      bw_streams_to_run_(0),
++      start_round_time_(QuicTime::Zero()),
++      start_round_bytes_(0),
++      measured_bw_(0),
++      use_default_prioritization_(false),
++      bw_id_(0),
++      bw_max_id_(0),
++      data_bytes_sent_(0),
++      last_data_bytes_sent_(0) {
++//      data_bytes_to_send_(0) {
+   closed_streams_clean_up_alarm_ =
+       absl::WrapUnique<QuicAlarm>(connection_->alarm_factory()->CreateAlarm(
+           new ClosedStreamsCleanUpDelegate(this)));
+@@ -564,6 +581,9 @@ bool QuicSession::CheckStreamNotBusyLooping(QuicStream* stream,
+       !stream->write_side_closed() &&
+       // Not connection flow control blocked.
+       !flow_controller_.IsBlocked() &&
++      // Not finished priority limit
++      !((connection_->clock()->ApproximateNow() - start_round_time_).ToMilliseconds() <  TIME_SLOT_MS &&
++	  (stream->GetSendBytes() == 0 || stream->GetMaxBytesRemain() == 0)) &&
+       // Detect lack of forward progress.
+       previous_bytes_written == stream->stream_bytes_written() &&
+       previous_fin_sent == stream->fin_sent()) {
+@@ -602,6 +622,8 @@ bool QuicSession::CheckStreamWriteBlocked(QuicStream* stream) const {
+ }
+ 
+ void QuicSession::OnCanWrite() {
++  bool bw_min_config = true;
++  uint64_t max_bw_bytes = static_cast<uint64_t>(pcc_max_bw) / (8 * TS_IN_SECOND);
+   if (connection_->framer().is_processing_packet()) {
+     // Do not write data in the middle of packet processing because rest
+     // frames in the packet may change the data to write. For example, lost
+@@ -681,6 +703,76 @@ void QuicSession::OnCanWrite() {
+     if (!CanWriteStreamData()) {
+       return;
+     }
++    if (start_round_time_ == QuicTime::Zero() || (connection_->clock()->ApproximateNow() - start_round_time_).ToMilliseconds()  >= TIME_SLOT_MS) {
++	if (start_round_time_ != QuicTime::Zero())
++	    DoMeasureBW();
++	SetBwMaxId(GetBwMaxId() + 1);
++	if (UseDefaultPriority())
++	    SetBwId(GetBwId() + 1);
++	if (start_round_time_ == QuicTime::Zero())
++	    start_round_time_ = connection_->clock()->ApproximateNow();
++	else {
++	    //Fix time resolution accuracy
++	    start_round_time_ = start_round_time_ + QuicTime::Delta::FromMilliseconds(TIME_SLOT_MS);
++	    if ((connection_->clock()->ApproximateNow() - start_round_time_).ToMilliseconds()  >= TIME_SLOT_MS)
++		start_round_time_ = connection_->clock()->ApproximateNow();
++	}
++	start_round_bytes_ = GetSendBytesSeq();
++	last_data_bytes_sent_ = data_bytes_sent_; //Start a new timeslot for global data rate
++/*	data_bytes_to_send_ += max_bw_bytes;
++	if (data_bytes_to_send_ > max_bw_bytes)
++	    data_bytes_to_send_ = max_bw_bytes;*/
++    }
++
++   /* {
++	static QuicTime last_print = QuicTime::Zero();
++	static int skipped = 0;
++#define PRINT_MS 500
++	if ((connection_->clock()->ApproximateNow() - last_print).ToMilliseconds() >= PRINT_MS) {
++	    std::cout << "max_bw_bytes: " << max_bw_bytes << ", Remained bytes: "
++		<< data_bytes_to_send_ << ", skipped: " << skipped << std::endl;
++	    skipped = 0;
++	    last_print = connection_->clock()->ApproximateNow();
++	} else
++	    skipped++;
++    }*/
++    // Limit global rate
++    // ToDo: Avoid limit of control streams
++    if (max_bw_bytes > 0 && data_bytes_sent_ - last_data_bytes_sent_ >= max_bw_bytes) {
++//    if (max_bw_bytes > 0 && data_bytes_to_send_ <=0) {
++	uint64_t time_left, time_passed = (connection_->clock()->ApproximateNow() - start_round_time_).ToMilliseconds();
++	if (TIME_SLOT_MS > time_passed)
++	    time_left = TIME_SLOT_MS - time_passed;
++	else
++	    time_left = 0;
++	if(!connection_->SendAlarm()->IsSet())
++	    connection_->SendAlarm()->Set(connection_->clock()->ApproximateNow() + QuicTime::Delta::FromMilliseconds(time_left));
++	return;
++    }
++/*    {
++	static QuicTime last_print = QuicTime::Zero();
++	static int skipped = 0;
++	if ((connection_->clock()->ApproximateNow() - last_print).ToSeconds() >= PRINT_SECONDS) {
++	    std::cout << "OnCanWrite: max_bw_bytes: " << max_bw_bytes << ", bytes sent in tick: "
++		<< data_bytes_sent_ - last_data_bytes_sent_ << ", skipped: " << skipped << std::endl;
++	    skipped = 0;
++	    last_print = connection_->clock()->ApproximateNow();
++	} else
++	    skipped++;
++    }*/
++    if (bw_streams_to_run_ <= 0 && !UseDefaultPriority() && bw_min_config == true) {
++	bw_min_config = DivideStreamBw(connection()->sent_packet_manager().BandwidthEstimate());
++
++/*	else {
++	    static QuicTime print_time = QuicTime::Zero();
++	    if ((connection_->clock()->ApproximateNow() - print_time).ToMilliseconds()  >= TIME_SLOT_MS / 2) {
++		print_time = connection_->clock()->ApproximateNow();
++//		std::cout << "Waiting for time slot completion: Passed MS " << (connection_->clock()->ApproximateNow() - start_round_time_).ToMilliseconds()  << "\n";
++	    }
++	    return;
++	}*/
++    }
++
+     currently_writing_stream_id_ = write_blocked_streams_.PopFront();
+     last_writing_stream_ids.push_back(currently_writing_stream_id_);
+     QUIC_DVLOG(1) << ENDPOINT << "Removing stream "
+@@ -694,7 +786,40 @@ void QuicSession::OnCanWrite() {
+       QUIC_DVLOG(1) << ENDPOINT << "stream " << stream->id()
+                     << " bytes_written " << previous_bytes_written << " fin "
+                     << previous_fin_sent;
++      if (stream->is_static() == false) {
++	  uint64_t already_sent = data_bytes_sent_ - last_data_bytes_sent_;
++	  uint64_t stream_sent_bytes = already_sent >= max_bw_bytes? 0 : max_bw_bytes - already_sent;
++/*	  //Convert bytes to send to be in packet size multiplication
++#define MIN_SIZE_TO_SEND 1200
++	  uint64_t session_send_size = (data_bytes_to_send_ + MIN_SIZE_TO_SEND - 1) / MIN_SIZE_TO_SEND;
++	  session_send_size *= MIN_SIZE_TO_SEND;*/
++	  SetPerStreamBw(*stream);
++	  if (max_bw_bytes > 0 && stream->GetMaxBytesRemain() > stream_sent_bytes) {
++//	  if (max_bw_bytes > 0 && stream->GetMaxBytesRemain() > session_send_size) {
++	      stream->SetMaxBytesRemain(stream_sent_bytes);
++/*	      {
++		  static QuicTime last_print = QuicTime::Zero();
++		  static int skipped = 0;
++		  if ((connection_->clock()->ApproximateNow() - last_print).ToSeconds() >= PRINT_SECONDS) {
++		      std::cout << "OnCanWrite 2: max_bw_bytes: " << max_bw_bytes << ", bytes sent in tick: "
++			  << data_bytes_sent_ - last_data_bytes_sent_ << ", skipped: " << skipped
++			  << ", Stream send bytes limit: " << stream->GetMaxBytesRemain() << std::endl;
++		      skipped = 0;
++		      last_print = connection_->clock()->ApproximateNow();
++		  } else
++		      skipped++;
++	      }*/
++	  }
++      }
+       stream->OnCanWrite();
++      if (!write_blocked_streams_.IsStreamBlocked(stream->id()))
++	  stream->SetSendBytes(0); //Remove from priority schedule
++      if (stream->is_static() == false) {
++	  if (stream->GetSendBytes() == 0)
++	      bw_streams_to_run_--;
++	  data_bytes_sent_ += stream->stream_bytes_written() - previous_bytes_written;
++//	  data_bytes_to_send_ -= stream->stream_bytes_written() - previous_bytes_written;
++      }
+       QUICHE_DCHECK(CheckStreamWriteBlocked(stream));
+       QUICHE_DCHECK(CheckStreamNotBusyLooping(stream, previous_bytes_written,
+                                               previous_fin_sent));
+@@ -712,6 +837,7 @@ bool QuicSession::SendProbingData() {
+ }
+ 
+ bool QuicSession::WillingAndAbleToWrite() const {
++  uint64_t max_bw_bytes = static_cast<uint64_t>(pcc_max_bw) / (8 * TS_IN_SECOND);
+   // Schedule a write when:
+   // 1) control frame manager has pending or new control frames, or
+   // 2) any stream has pending retransmissions, or
+@@ -730,6 +856,12 @@ bool QuicSession::WillingAndAbleToWrite() const {
+       !streams_with_pending_retransmission_.empty()) {
+     return true;
+   }
++  //Don't reschedule when defined max BW and max BW reached
++  if (max_bw_bytes > 0 && data_bytes_sent_ - last_data_bytes_sent_ >= max_bw_bytes
++//  if (max_bw_bytes > 0 && data_bytes_to_send_ <= 0
++	  && (connection_->clock()->ApproximateNow() - start_round_time_).ToMilliseconds() < TIME_SLOT_MS) {
++      return false;
++  }
+   if (flow_controller_.IsBlocked()) {
+     if (VersionUsesHttp3(transport_version())) {
+       return false;
+@@ -2082,17 +2214,26 @@ size_t QuicSession::GetNumActiveStreams() const {
+          num_zombie_streams_;
+ }
+ 
++#define WRITE_BLOCK_THRESHOLD 16000
+ void QuicSession::MarkConnectionLevelWriteBlocked(QuicStreamId id) {
+-  if (GetOrCreateStream(id) == nullptr) {
++  bool priority_enabled = false, be_front = false;
++  QuicStream *stream = GetOrCreateStream(id);
++  if (stream == nullptr) {
+     QUIC_BUG(quic_bug_10866_11)
+         << "Marking unknown stream " << id << " blocked.";
+     QUIC_LOG_FIRST_N(ERROR, 2) << QuicStackTrace();
++  } else {
++      // 1. Our priority: push front if there is remained quota. 2. Default priority: push front if remain and sent < 16K. 2. Otherwise: check only 16K(original).
++      priority_enabled = stream->GetBwMax() > 0 && ! UseDefaultPriority();
++      be_front = stream->GetSendBytes() > 0 && stream->GetMaxBytesRemain() > 0;
++      if (stream->GetBwMax() == 0)
++	  be_front = true;
+   }
+ 
+   QUIC_DVLOG(1) << ENDPOINT << "Adding stream " << id
+                 << " to write-blocked list";
+ 
+-  write_blocked_streams_.AddStream(id);
++  write_blocked_streams_.AddStream(id, priority_enabled, be_front);
+ }
+ 
+ bool QuicSession::HasDataToWrite() const {
+@@ -2103,6 +2244,10 @@ bool QuicSession::HasDataToWrite() const {
+          control_frame_manager_.WillingToWrite();
+ }
+ 
++bool QuicSession::HasBlockedStreams() const {
++  return write_blocked_streams_.HasWriteBlockedDataStreams();
++}
++
+ void QuicSession::OnAckNeedsRetransmittableFrame() {
+   flow_controller_.SendWindowUpdate();
+ }
+@@ -2675,5 +2820,126 @@ bool QuicSession::ValidateToken(absl::string_view token) {
+   return valid;
+ }
+ 
++QuicByteCount QuicSession::BandwidthToBytes(int64_t bw) {
++    return bw * TIME_SLOT_MS / 1000 / 8;
++}
++
++#define ONE_MBPS 1000000
++bool QuicSession::DivideStreamBw(QuicBandwidth cur_bw) {
++    int64_t bw_min=0, bw_max=0, bw_div=0, bw_score=0, *bw_min_addr = &bw_min, *bw_max_addr = &bw_max;
++    int64_t bw_prioritized=0, *bw_prioritized_addr = &bw_prioritized;
++    int64_t cur_bits = cur_bw.ToBitsPerSecond();
++    if (measured_bw_ > 0)
++	cur_bits = measured_bw_;
++    if (cur_bits < ONE_MBPS)
++	cur_bits = ONE_MBPS;
++    //measured_bw_ = 0;
++
++    bw_streams_to_run_ = 0;
++    PerformActionOnActiveStreams([this, bw_min_addr, bw_max_addr, bw_prioritized_addr](QuicStream* stream) mutable {
++      *bw_min_addr += stream->GetBwMin();
++      *bw_max_addr += stream->GetBwMax();
++      if (stream->IsPrioritized())
++        *bw_prioritized_addr += stream->GetBwMin();
++      bw_streams_to_run_++;
++      stream->SetSendBytes(0);
++      return true;
++    });
++
++    //std::cout << "DivideStreamBw: bw_min " << bw_min << " bw_max " << bw_max << '\n';
++    if (bw_min > cur_bits) {
++      available_bw_state_ = BANDWITH_BELOW_MIN;
++      bw_div = cur_bits - bw_prioritized;
++      bw_score = bw_min;
++    } else if (bw_max > cur_bits) {
++      available_bw_state_ = BANDWITH_MIN_TO_MAX;
++      bw_div = cur_bits - bw_min;
++      bw_score = (bw_min + bw_max) / 2;
++    } else if (bw_max > 0) {
++      available_bw_state_ = BANDWITH_OVER_MAX;
++      bw_div = cur_bits - bw_max;
++      bw_score = (bw_min + bw_max) / 2;
++    } else {
++      available_bw_state_ = BANDWITH_NOT_INITIALIZED;
++      return false;
++    }
++
++    if (bw_score > 0 && bw_div > 0) {
++      stream_send_part_ = (double)bw_div / bw_score;
++    } else {
++      stream_send_part_ = 0.0;
++    }
++
++//    std::cout << "DivideStreamBw: cur_bits " << cur_bits << ", bw_min " << bw_min << ", bw_max " << bw_max << ", bw_score " << bw_score << '\n';
++    SetBwId(GetBwId() + 1);
++    return true;
++}
++
++void QuicSession::SetPerStreamBw(QuicStream & stream) {
++    int64_t bw_min = stream.GetBwMin();
++    int64_t bw_max = stream.GetBwMax();
++    QuicByteCount bytes_to_send;
++    //static int count = 0;
++
++    if (stream.GetBwMaxId() != GetBwMaxId()) {
++	stream.SetMaxBytesRemain(BandwidthToBytes(bw_max));
++	stream.SetBwMaxId(GetBwMaxId());
++    }
++    if (stream.GetBwId() == GetBwId())
++	return;
++    if (UseDefaultPriority())
++	 bytes_to_send = (QuicByteCount)std::numeric_limits<int64_t>::max;
++    else switch (available_bw_state_) {
++      case BANDWITH_BELOW_MIN:
++	if (stream.IsPrioritized())
++	    bytes_to_send = (QuicByteCount)BandwidthToBytes(bw_min);
++	else
++	    bytes_to_send = (QuicByteCount)(stream_send_part_ * BandwidthToBytes(bw_min));
++	break;
++      case BANDWITH_MIN_TO_MAX:
++	bytes_to_send = (QuicByteCount)(((stream_send_part_ *  BandwidthToBytes(bw_min + bw_max)) / 2) + BandwidthToBytes(bw_min));
++	break;
++      case BANDWITH_OVER_MAX:
++	bytes_to_send = (QuicByteCount)(/*((stream_send_part_ *  BandwidthToBytes(bw_min + bw_max)) / 2) + */BandwidthToBytes(bw_max));
++	break;
++      default:
++	bytes_to_send = 0;
++	break;
++    }
++    //std::cout << "SetStreamBw: " << count << ": Time: " << connection_->clock()->ApproximateNow() << ", Stream: " << stream.id() << ", bytes_to_send "
++        //<< bytes_to_send << ", bw_min: " << bw_min << ", bw_max: " << bw_max << ", bw_streams_to_run_" << bw_streams_to_run_ << '\n';
++    //if (bw_streams_to_run_ <= 1)
++    //    count++;
++    stream.SetSendBytes(bytes_to_send);
++    stream.SetBwId(GetBwId());
++}
++
++QuicByteCount QuicSession::GetSendBytesSeq() {
++    QuicByteCount send_count = 0, *send_count_addr = &send_count;
++    PerformActionOnActiveStreams([send_count_addr](QuicStream* stream) mutable {
++      *send_count_addr += stream->stream_num_bytes_acked();
++      return true;
++    });
++    return send_count;
++}
++
++void QuicSession::DoMeasureBW() {
++    int64_t delta, cur_bw;
++    QuicByteCount bytes;
++    delta = (connection_->clock()->ApproximateNow() - start_round_time_).ToMicroseconds();
++    bytes = GetSendBytesSeq() - start_round_bytes_;
++    cur_bw = bytes * 8 * 1000000 / delta;
++    measured_bw_ = measured_bw_ > 0? ((measured_bw_ * 3) / 4) + (cur_bw / 4) : cur_bw;
++//    measured_bw_ = measured_bw_ > 0? (measured_bw_ / 2) + (cur_bw / 2) : cur_bw;
++//    measured_bw_ = cur_bw;
++    //std::cout << "BW measure: " << cur_bw << ". Smoothed BW: " << measured_bw_ << ". Bytes: " << bytes << ". Delta: " << delta << '\n';
++}
++
++void QuicSession::SetPccMinMaxBw(int32_t min, int32_t max) {
++    PccUtilityManager::SetHerculesMinMaxBw(min, max);
++    pcc_max_bw = max;
++    std::cout << "pcc_max_bw = " << pcc_max_bw << std::endl;
++}
++
+ #undef ENDPOINT  // undef for jumbo builds
+ }  // namespace quic
+diff --git a/quic/core/quic_session.h b/quic/core/quic_session.h
+index cb06d87b..c4b95dbb 100644
+--- a/quic/core/quic_session.h
++++ b/quic/core/quic_session.h
+@@ -45,6 +45,7 @@
+ #include "quic/platform/api/quic_mem_slice.h"
+ #include "quic/platform/api/quic_socket_address.h"
+ #include "common/quiche_linked_hash_map.h"
++#include "quic/core/quic_bandwidth.h"
+ 
+ namespace quic {
+ 
+@@ -57,6 +58,14 @@ namespace test {
+ class QuicSessionPeer;
+ }  // namespace test
+ 
++enum QUIC_BANDWITH_STATE {
++    BANDWITH_NOT_INITIALIZED,
++    BANDWITH_BELOW_MIN,
++    BANDWITH_MIN_TO_MAX,
++    BANDWITH_OVER_MAX,
++    BANDWITH_FIELD_OVERFLOW,
++};
++
+ class QUIC_EXPORT_PRIVATE QuicSession
+     : public QuicConnectionVisitorInterface,
+       public SessionNotifierInterface,
+@@ -394,6 +403,8 @@ class QUIC_EXPORT_PRIVATE QuicSession
+   // connection, or in a write-blocked stream.
+   bool HasDataToWrite() const;
+ 
++  // Return true if there are streams waiting for write
++  bool HasBlockedStreams() const;
+   // Initiates a path validation on the path described in the given context,
+   // asynchronously calls |result_delegate| upon success or failure.
+   // The initiator should extend QuicPathValidationContext to provide the writer
+@@ -630,6 +641,10 @@ class QUIC_EXPORT_PRIVATE QuicSession
+   // Try converting all pending streams to normal streams.
+   void ProcessAllPendingStreams();
+ 
++  uint32_t GetBwId() {return bw_id_;}
++  void SetBwId(uint32_t id) {bw_id_ = id;}
++  uint32_t GetBwMaxId() {return bw_max_id_;}
++  void SetBwMaxId(uint32_t id) {bw_max_id_ = id;}
+  protected:
+   using StreamMap =
+       absl::flat_hash_map<QuicStreamId, std::unique_ptr<QuicStream>>;
+@@ -808,6 +823,9 @@ class QUIC_EXPORT_PRIVATE QuicSession
+     return absl::nullopt;
+   }
+ 
++  void SetUseDefaultPriority(bool priority) {use_default_prioritization_ = priority;}
++  bool UseDefaultPriority() {return use_default_prioritization_;}
++  void SetPccMinMaxBw(int32_t min, int32_t max);
+  private:
+   friend class test::QuicSessionPeer;
+ 
+@@ -1005,6 +1023,42 @@ class QUIC_EXPORT_PRIVATE QuicSession
+ 
+   const bool support_client_cert_ =
+       GetQuicRestartFlag(quic_tls_server_support_client_cert);
++
++  // Convertor
++  QuicByteCount BandwidthToBytes(int64_t bw);
++
++  // Divide connection BW between streams
++  bool DivideStreamBw(QuicBandwidth cur_bw);
++
++  // Calc single stream BW from global division
++  void SetPerStreamBw(QuicStream & stream);
++
++  // Get number of bytes sent all streams
++  QuicByteCount GetSendBytesSeq();
++
++  void DoMeasureBW();
++
++  // Per stream send amount permition base
++  double  stream_send_part_;
++
++  // Available BW state
++  QUIC_BANDWITH_STATE available_bw_state_;
++
++  // Number of streams to process in BW devision round
++  int32_t bw_streams_to_run_;
++
++  // Start round time and total number of bytes
++  QuicTime start_round_time_;
++  QuicByteCount start_round_bytes_;
++
++  // Measured BW
++  int64_t measured_bw_;
++  bool use_default_prioritization_;
++  uint32_t bw_id_;
++  uint32_t bw_max_id_;
++  uint64_t data_bytes_sent_;
++  uint64_t last_data_bytes_sent_;
++//  int64_t data_bytes_to_send_;
+ };
+ 
+ }  // namespace quic
+diff --git a/quic/core/quic_stream.cc b/quic/core/quic_stream.cc
+index f055bdf2..bd36fcd2 100644
+--- a/quic/core/quic_stream.cc
++++ b/quic/core/quic_stream.cc
+@@ -375,7 +375,11 @@ QuicStream::QuicStream(QuicStreamId id, QuicSession* session,
+                                            session->version())
+                 : type),
+       creation_time_(session->connection()->clock()->ApproximateNow()),
+-      perspective_(session->perspective()) {
++      perspective_(session->perspective()),
++      bw_min_(0),
++      bw_max_(0),
++      prioritized_(false),
++      bw_id_(0) {
+   if (type_ == WRITE_UNIDIRECTIONAL) {
+     fin_received_ = true;
+     CloseReadSide();
+@@ -1217,6 +1221,7 @@ bool QuicStream::WriteStreamData(QuicStreamOffset offset,
+ 
+ void QuicStream::WriteBufferedData(EncryptionLevel level) {
+   QUICHE_DCHECK(!write_side_closed_ && (HasBufferedData() || fin_buffered_));
++  bool priority_blocked = false;
+ 
+   if (session_->ShouldYield(id())) {
+     session_->MarkConnectionLevelWriteBlocked(id());
+@@ -1262,6 +1267,19 @@ void QuicStream::WriteBufferedData(EncryptionLevel level) {
+                   << write_length << " due to flow control";
+   }
+ 
++  if (GetBwMax() > 0 && is_static() == false && ((session_->HasBlockedStreams() && 
++	  write_length > send_bytes_allow_) || write_length > max_bytes_remain_)) {
++    if (session_->HasBlockedStreams())
++	write_length = std::min(send_bytes_allow_, max_bytes_remain_);
++    else
++	write_length = max_bytes_remain_;
++    priority_blocked = true;
++    if (write_length == 0) {
++      session_->MarkConnectionLevelWriteBlocked(id());
++      return;
++    }
++  }
++
+   StreamSendingState state = fin ? FIN : NO_FIN;
+   if (fin && add_random_padding_after_fin_) {
+     state = FIN_AND_PADDING;
+@@ -1272,6 +1290,10 @@ void QuicStream::WriteBufferedData(EncryptionLevel level) {
+ 
+   OnStreamDataConsumed(consumed_data.bytes_consumed);
+ 
++  if (GetBwMax() > 0 && is_static() == false) {
++    send_bytes_allow_ -= std::min(consumed_data.bytes_consumed, send_bytes_allow_);
++    max_bytes_remain_ -= std::min(consumed_data.bytes_consumed, max_bytes_remain_);
++  }
+   AddBytesSent(consumed_data.bytes_consumed);
+   QUIC_DVLOG(1) << ENDPOINT << "stream " << id_ << " sends "
+                 << stream_bytes_written() << " bytes "
+@@ -1285,7 +1307,7 @@ void QuicStream::WriteBufferedData(EncryptionLevel level) {
+     return;
+   }
+ 
+-  if (consumed_data.bytes_consumed == write_length) {
++  if (consumed_data.bytes_consumed == write_length && priority_blocked == false) {
+     if (!fin_with_zero_data) {
+       MaybeSendBlocked();
+     }
+@@ -1328,6 +1350,10 @@ uint64_t QuicStream::stream_bytes_written() const {
+   return send_buffer_.stream_bytes_written();
+ }
+ 
++uint64_t QuicStream::stream_num_bytes_acked () const {
++    return stream_bytes_written() - send_buffer_.stream_bytes_outstanding();
++}
++
+ const QuicIntervalSet<QuicStreamOffset>& QuicStream::bytes_acked() const {
+   return send_buffer_.bytes_acked();
+ }
+diff --git a/quic/core/quic_stream.h b/quic/core/quic_stream.h
+index dc129a28..f5f46a6b 100644
+--- a/quic/core/quic_stream.h
++++ b/quic/core/quic_stream.h
+@@ -257,6 +257,7 @@ class QUIC_EXPORT_PRIVATE QuicStream
+ 
+   uint64_t stream_bytes_read() const { return stream_bytes_read_; }
+   uint64_t stream_bytes_written() const;
++  uint64_t stream_num_bytes_acked () const;
+ 
+   size_t busy_counter() const { return busy_counter_; }
+   void set_busy_counter(size_t busy_counter) { busy_counter_ = busy_counter; }
+@@ -403,6 +404,30 @@ class QUIC_EXPORT_PRIVATE QuicStream
+   // indicating it can start processing data.
+   void OnStreamCreatedFromPendingStream();
+ 
++  int64_t GetBwMin() { return bw_min_; }
++
++  void SetBwMin(int64_t bw) { bw_min_ = bw; }
++
++  int64_t GetBwMax() { return bw_max_; }
++
++  void SetBwMax(int64_t bw) { bw_max_ = bw; }
++
++  QuicByteCount GetSendBytes() { return send_bytes_allow_; }
++
++  void SetSendBytes(QuicByteCount bytes) { send_bytes_allow_ = bytes; }
++
++  QuicByteCount GetMaxBytesRemain() { return max_bytes_remain_; }
++
++  void SetMaxBytesRemain(QuicByteCount bytes) { max_bytes_remain_ = bytes; }
++
++  void SetPrioritized(bool prioritized) { prioritized_ = prioritized; }
++
++  bool IsPrioritized() { return prioritized_; }
++
++  uint32_t GetBwId() {return bw_id_;}
++  void SetBwId(uint32_t id) {bw_id_ = id;}
++  uint32_t GetBwMaxId() {return bw_max_id_;}
++  void SetBwMaxId(uint32_t id) {bw_max_id_ = id;}
+  protected:
+   // Called when data of [offset, offset + data_length] is buffered in send
+   // buffer.
+@@ -616,6 +641,18 @@ class QUIC_EXPORT_PRIVATE QuicStream
+   const QuicTime creation_time_;
+ 
+   Perspective perspective_;
++
++  int64_t bw_min_;
++
++  int64_t bw_max_;
++
++  QuicByteCount send_bytes_allow_ = 0;
++  QuicByteCount max_bytes_remain_ = 0;
++
++  bool prioritized_;
++
++  uint32_t bw_id_;
++  uint32_t bw_max_id_;
+ };
+ 
+ }  // namespace quic
+diff --git a/quic/core/quic_types.h b/quic/core/quic_types.h
+index b048121d..3319a17d 100644
+--- a/quic/core/quic_types.h
++++ b/quic/core/quic_types.h
+@@ -457,6 +457,7 @@ enum CongestionControlType {
+   kRenoBytes,
+   kBBR,
+   kPCC,
++  kPccVV,
+   kGoogCC,
+   kBBRv2,
+ };
+diff --git a/quic/core/quic_write_blocked_list.cc b/quic/core/quic_write_blocked_list.cc
+index 084241db..e5db2e98 100644
+--- a/quic/core/quic_write_blocked_list.cc
++++ b/quic/core/quic_write_blocked_list.cc
+@@ -104,13 +104,13 @@ void QuicWriteBlockedList::UpdateBytesForStream(QuicStreamId stream_id,
+   }
+ }
+ 
+-void QuicWriteBlockedList::AddStream(QuicStreamId stream_id) {
++void QuicWriteBlockedList::AddStream(QuicStreamId stream_id, bool priority, bool front) {
+   if (static_stream_collection_.SetBlocked(stream_id)) {
+     return;
+   }
+ 
+-  bool push_front =
+-      stream_id == batch_write_stream_id_[last_priority_popped_] &&
++  bool push_front = priority ? front :
++      front && stream_id == batch_write_stream_id_[last_priority_popped_] &&
+       bytes_left_for_batch_write_[last_priority_popped_] > 0;
+   priority_write_scheduler_.MarkStreamReady(stream_id, push_front);
+ }
+diff --git a/quic/core/quic_write_blocked_list.h b/quic/core/quic_write_blocked_list.h
+index 54441e77..814ad412 100644
+--- a/quic/core/quic_write_blocked_list.h
++++ b/quic/core/quic_write_blocked_list.h
+@@ -72,7 +72,7 @@ class QUIC_EXPORT_PRIVATE QuicWriteBlockedList {
+   // is latched for doing batched writes in which case it goes to the front of
+   // the list for its priority level.
+   // Headers and crypto streams are special cased to always resume first.
+-  void AddStream(QuicStreamId stream_id);
++  void AddStream(QuicStreamId stream_id, bool priority, bool front);
+ 
+   // Returns true if stream with |stream_id| is write blocked.
+   bool IsStreamBlocked(QuicStreamId stream_id) const;
+diff --git a/quic/tools/quic_simple_client_session.cc b/quic/tools/quic_simple_client_session.cc
+index 2e709195..4c7776d6 100644
+--- a/quic/tools/quic_simple_client_session.cc
++++ b/quic/tools/quic_simple_client_session.cc
+@@ -51,4 +51,20 @@ HttpDatagramSupport QuicSimpleClientSession::LocalHttpDatagramSupport() {
+                                : HttpDatagramSupport::kNone;
+ }
+ 
++bool compareStreamIdBytes(struct StreamIdBytes i1, struct StreamIdBytes i2)
++{
++    return (i1.id > i2.id);
++}
++
++void QuicSimpleClientSession::GetStreamsBytes(std::vector<struct StreamIdBytes>* count) {
++  PerformActionOnActiveStreams([count](QuicStream* stream) mutable {
++	  struct StreamIdBytes id_bytes;
++	  id_bytes.id = stream->id();
++	  id_bytes.len = stream->stream_bytes_read();
++	  count->push_back(id_bytes);
++	  return true;
++  });
++  std::sort(count->begin(), count->end(), compareStreamIdBytes);
++}
++
+ }  // namespace quic
+diff --git a/quic/tools/quic_simple_client_session.h b/quic/tools/quic_simple_client_session.h
+index 63714480..0cbae0ad 100644
+--- a/quic/tools/quic_simple_client_session.h
++++ b/quic/tools/quic_simple_client_session.h
+@@ -8,6 +8,11 @@
+ #include "quic/core/http/quic_spdy_client_session.h"
+ #include "quic/tools/quic_simple_client_stream.h"
+ 
++struct StreamIdBytes {
++    quic::QuicStreamId id;
++    uint64_t len;
++};
++
+ namespace quic {
+ 
+ class QuicSimpleClientSession : public QuicSpdyClientSession {
+@@ -32,6 +37,7 @@ class QuicSimpleClientSession : public QuicSpdyClientSession {
+   bool ShouldNegotiateWebTransport() override;
+   bool ShouldNegotiateDatagramContexts() override;
+   HttpDatagramSupport LocalHttpDatagramSupport() override;
++  void GetStreamsBytes(std::vector<struct StreamIdBytes>* count);
+ 
+  private:
+   const bool drop_response_body_;
+diff --git a/quic/tools/quic_simple_client_stream.cc b/quic/tools/quic_simple_client_stream.cc
+index 21145e1e..de6558b1 100644
+--- a/quic/tools/quic_simple_client_stream.cc
++++ b/quic/tools/quic_simple_client_stream.cc
+@@ -13,11 +13,12 @@ void QuicSimpleClientStream::OnBodyAvailable() {
+   }
+ 
+   while (HasBytesToRead()) {
+-    struct iovec iov;
+-    if (GetReadableRegions(&iov, 1) == 0) {
+-      break;
+-    }
+-    MarkConsumed(iov.iov_len);
++    struct iovec iov[10];
++    int i;
++    int iov_used = GetReadableRegions(iov, 10);
++
++    for(i = 0; i < iov_used; i++)
++	MarkConsumed(iov[i].iov_len);
+   }
+   if (sequencer()->IsClosed()) {
+     OnFinRead();
+diff --git a/quic/tools/quic_simple_server_session.cc b/quic/tools/quic_simple_server_session.cc
+index d1e9a73e..9e0e53f5 100644
+--- a/quic/tools/quic_simple_server_session.cc
++++ b/quic/tools/quic_simple_server_session.cc
+@@ -5,6 +5,9 @@
+ #include "quic/tools/quic_simple_server_session.h"
+ 
+ #include <utility>
++#include <iostream>
++#include <string>
++#include <regex>
+ 
+ #include "absl/memory/memory.h"
+ #include "quic/core/http/quic_server_initiated_spdy_stream.h"
+@@ -16,6 +19,29 @@
+ #include "quic/platform/api/quic_logging.h"
+ #include "quic/tools/quic_simple_server_stream.h"
+ 
++extern std::string FLAGS_stream_min_bw;
++extern std::string FLAGS_stream_max_bw;
++extern std::string FLAGS_stream_priority;
++extern bool FLAGS_use_default_prioritization;
++extern int32_t FLAGS_con_min_bw;
++extern int32_t FLAGS_con_max_bw;
++
++static std::vector<std::string> split(const std::string str, const std::string delim)
++{
++    std::vector<std::string> tokens;
++    size_t prev = 0, pos = 0;
++    do
++    {
++        pos = str.find(delim, prev);
++        if (pos == std::string::npos) pos = str.length();
++	std::string token = str.substr(prev, pos-prev);
++        if (!token.empty()) tokens.push_back(token);
++        prev = pos + delim.length();
++    }
++    while (pos < str.length() && prev < str.length());
++    return tokens;
++}
++
+ namespace quic {
+ 
+ QuicSimpleServerSession::QuicSimpleServerSession(
+@@ -29,8 +55,19 @@ QuicSimpleServerSession::QuicSimpleServerSession(
+                             helper, crypto_config, compressed_certs_cache),
+       highest_promised_stream_id_(
+           QuicUtils::GetInvalidStreamId(connection->transport_version())),
+-      quic_simple_server_backend_(quic_simple_server_backend) {
++      quic_simple_server_backend_(quic_simple_server_backend),
++      stream_count_(0) {
++  const std::string delimeter = ",";
+   QUICHE_DCHECK(quic_simple_server_backend_);
++  min_bw_vector_ = split(GetQuicFlag(FLAGS_stream_min_bw), delimeter);
++  max_bw_vector_ = split(GetQuicFlag(FLAGS_stream_max_bw), delimeter);
++  priority_vector_ = split(GetQuicFlag(FLAGS_stream_priority), delimeter);
++  SetUseDefaultPriority(GetQuicFlag(FLAGS_use_default_prioritization));
++  SetPccMinMaxBw(GetQuicFlag(FLAGS_con_min_bw), GetQuicFlag(FLAGS_con_max_bw));
++  std::cout << "QuicSimpleServerSession: min_bw_vector_ " << min_bw_vector_ << ", max_bw_vector_ " << max_bw_vector_
++      << ", priority vector_ " << priority_vector_ << " , use_default_prioritization_ " << UseDefaultPriority() 
++      << ", con_min_bw " << GetQuicFlag(FLAGS_con_min_bw) << ", con_max_bw "
++      << GetQuicFlag(FLAGS_con_max_bw) << '\n';
+ }
+ 
+ QuicSimpleServerSession::~QuicSimpleServerSession() { DeleteConnection(); }
+@@ -62,6 +99,16 @@ QuicSpdyStream* QuicSimpleServerSession::CreateIncomingStream(QuicStreamId id) {
+   QuicSpdyStream* stream = new QuicSimpleServerStream(
+       id, this, BIDIRECTIONAL, quic_simple_server_backend_);
+   ActivateStream(absl::WrapUnique(stream));
++  std::cout << "CreateIncomingStream: stream_count_ " << stream_count_ << ", is static " << stream->is_static() << '\n';
++  if (stream->is_static() == false && min_bw_vector_.size() > stream_count_  && max_bw_vector_.size() > stream_count_) {
++      std::cout << "CreateIncomingStream: bw_min " << min_bw_vector_[stream_count_] << ", bw_max " << max_bw_vector_[stream_count_] << '\n';
++      stream->SetBwMin(stoi(min_bw_vector_[stream_count_]));
++      stream->SetBwMax(stoi(max_bw_vector_[stream_count_]));
++      if(priority_vector_.size() > stream_count_ && stoi(priority_vector_[stream_count_]) != 0)
++	      stream->SetPrioritized(true);
++      stream_count_++;
++  }
++  std::cout << "CreateIncomingStream: bw_min " << stream->GetBwMin() << ", bw_max " << stream->GetBwMax() << ", Is prioritized? " << stream->IsPrioritized() << '\n';
+   return stream;
+ }
+ 
+diff --git a/quic/tools/quic_simple_server_session.h b/quic/tools/quic_simple_server_session.h
+index 393a2d8d..6c96ada5 100644
+--- a/quic/tools/quic_simple_server_session.h
++++ b/quic/tools/quic_simple_server_session.h
+@@ -20,6 +20,7 @@
+ #include "quic/core/http/quic_spdy_session.h"
+ #include "quic/core/quic_crypto_server_stream_base.h"
+ #include "quic/core/quic_packets.h"
++#include "quic/core/quic_tag.h"
+ #include "quic/platform/api/quic_containers.h"
+ #include "quic/tools/quic_backend_response.h"
+ #include "quic/tools/quic_simple_server_backend.h"
+@@ -153,6 +154,12 @@ class QuicSimpleServerSession : public QuicServerSessionBase {
+   quiche::QuicheCircularDeque<PromisedStreamInfo> promised_streams_;
+ 
+   QuicSimpleServerBackend* quic_simple_server_backend_;  // Not owned.
++
++  std::vector<std::string> min_bw_vector_;
++  std::vector<std::string> max_bw_vector_;
++  std::vector<std::string> priority_vector_;
++
++  uint32_t stream_count_;
+ };
+ 
+ }  // namespace quic
+diff --git a/quic/tools/quic_simple_server_stream.cc b/quic/tools/quic_simple_server_stream.cc
+index 0ea0e50a..14b60837 100644
+--- a/quic/tools/quic_simple_server_stream.cc
++++ b/quic/tools/quic_simple_server_stream.cc
+@@ -323,7 +323,7 @@ void QuicSimpleServerStream::OnCanWrite() {
+ }
+ 
+ void QuicSimpleServerStream::WriteGeneratedBytes() {
+-  static size_t kChunkSize = 1024;
++  static size_t kChunkSize = 1024 * 50;
+   while (!HasBufferedData() && generate_bytes_length_ > 0) {
+     size_t len = std::min<size_t>(kChunkSize, generate_bytes_length_);
+     std::string data(len, 'a');
+diff --git a/quic/tools/quic_spdy_client_base.cc b/quic/tools/quic_spdy_client_base.cc
+index 464fa70f..501057b7 100644
+--- a/quic/tools/quic_spdy_client_base.cc
++++ b/quic/tools/quic_spdy_client_base.cc
+@@ -174,6 +174,18 @@ void QuicSpdyClientBase::SendRequestsAndWaitForResponse(
+   }
+ }
+ 
++void QuicSpdyClientBase::SendRequests(
++    const std::vector<std::string>& url_list) {
++  for (size_t i = 0; i < url_list.size(); ++i) {
++    Http2HeaderBlock headers;
++    if (!SpdyUtils::PopulateHeaderBlockFromUrl(url_list[i], &headers)) {
++      QUIC_BUG(quic_bug_10949_2) << "Unable to create request";
++      continue;
++    }
++    SendRequest(headers, "", true);
++  }
++}
++
+ QuicSpdyClientStream* QuicSpdyClientBase::CreateClientStream() {
+   if (!connected()) {
+     return nullptr;
+diff --git a/quic/tools/quic_spdy_client_base.h b/quic/tools/quic_spdy_client_base.h
+index 3e417253..193d9ba1 100644
+--- a/quic/tools/quic_spdy_client_base.h
++++ b/quic/tools/quic_spdy_client_base.h
+@@ -98,6 +98,9 @@ class QuicSpdyClientBase : public QuicClientBase,
+   // each to complete.
+   void SendRequestsAndWaitForResponse(const std::vector<std::string>& url_list);
+ 
++  // Sends a request simple GET for each URL in |url_list|, and don't wait
++  void SendRequests(const std::vector<std::string>& url_list);
++
+   // Returns a newly created QuicSpdyClientStream.
+   QuicSpdyClientStream* CreateClientStream();
+ 
+diff --git a/quic/tools/quic_toy_client.cc b/quic/tools/quic_toy_client.cc
+index 83fd7c08..7dec4626 100644
+--- a/quic/tools/quic_toy_client.cc
++++ b/quic/tools/quic_toy_client.cc
+@@ -64,6 +64,8 @@
+ #include "quic/tools/fake_proof_verifier.h"
+ #include "quic/tools/quic_url.h"
+ #include "common/quiche_text_utils.h"
++#include "quic/tools/quic_simple_client_session.h"
++#include <time.h>
+ 
+ namespace {
+ 
+@@ -229,6 +231,55 @@ DEFINE_QUIC_COMMAND_LINE_FLAG(int32_t, max_time_before_crypto_handshake_ms,
+ DEFINE_QUIC_COMMAND_LINE_FLAG(int32_t, max_inbound_header_list_size, 128 * 1024,
+                               "Max inbound header list size. 0 means default.");
+ 
++DEFINE_QUIC_COMMAND_LINE_FLAG(bool,
++                              parallel,
++                              false,
++                              "Run several requests in parallel.");
++
++/*DEFINE_QUIC_COMMAND_LINE_FLAG(int32_t,
++                              print_delay,
++                              1000,
++                              "Delay between streams BW prints in ms.");*/
++
++// Following 6 configuration are not used by client just for compatibility
++DEFINE_QUIC_COMMAND_LINE_FLAG(
++    std::string,
++    stream_min_bw,
++    "",
++    "Define a number which represent weighted dynamic priority for min value,"
++    "Several definitions are valid and will apply to streams according to open.");
++
++DEFINE_QUIC_COMMAND_LINE_FLAG(
++    std::string,
++    stream_max_bw,
++    "",
++    "Define a number which represent weighted dynamic priority for max value,"
++    "Several definitions are valid and will apply to streams according to open.");
++
++
++DEFINE_QUIC_COMMAND_LINE_FLAG(
++    std::string,
++    stream_priority,
++    "",
++    "Define if a stream has priority (single level), 0 or 1 are used."
++    "Several definitions are valid and will apply to streams according to open.");
++
++DEFINE_QUIC_COMMAND_LINE_FLAG(bool,
++                              use_default_prioritization,
++                              false,
++                              "If true, defauld SPDY 3 prioritization is used");
++DEFINE_QUIC_COMMAND_LINE_FLAG(
++    int32_t,
++    con_min_bw,
++    0,
++    "Define which min BW is required for QUIC connection");
++
++DEFINE_QUIC_COMMAND_LINE_FLAG(
++    int32_t,
++    con_max_bw,
++    0,
++    "Define which max BW is required for QUIC connection");
++
+ namespace quic {
+ namespace {
+ 
+@@ -450,7 +501,32 @@ int QuicToyClient::SendRequestsAndPrintResponses(
+   // Make sure to store the response, for later output.
+   client->set_store_response(true);
+ 
+-  for (int i = 0; i < num_requests; ++i) {
++  if (GetQuicFlag(FLAGS_parallel)) {
++    bool streams;
++    struct timespec start_t, now_t;
++    client->SendRequests(urls);
++#define US_IN_SEC 1000000
++#define NS_IN_US 1000
++#define US_IN_MS 1000
++    do {
++      std::vector<struct StreamIdBytes> count;
++      ((QuicSimpleClientSession*)client->client_session())->GetStreamsBytes(&count);
++      clock_gettime(CLOCK_MONOTONIC_RAW, &start_t);
++      now_t = start_t;
++      streams = count.size() > 0;
++      std::cout << "streams:(" << count.size() << ")\t" << start_t.tv_sec << "." << start_t.tv_nsec / NS_IN_US << "\t";
++      for (struct StreamIdBytes i: count) {
++	  std::cout << i.id << ": " << i.len << " \t";
++      }
++      std::cout << "\n";
++      do {
++	  client->WaitForEvents();
++	  clock_gettime(CLOCK_MONOTONIC_RAW, &now_t);
++      } while (now_t.tv_sec == start_t.tv_sec); //Fix for Hercules to synchronise clients time,  hardcoded to every new second
++  /*    } while (streams && ((now_t.tv_sec - start_t.tv_sec)* US_IN_SEC)
++	      + ((now_t.tv_nsec - start_t.tv_nsec) / NS_IN_US) <= GetQuicFlag(FLAGS_print_delay) * US_IN_MS);*/
++    } while (streams);
++  } else for (int i = 0; i < num_requests; ++i) {
+     // Send the request.
+     client->SendRequestAndWaitForResponse(header_block, body, /*fin=*/true);
+ 
+diff --git a/quic/tools/quic_toy_server.cc b/quic/tools/quic_toy_server.cc
+index e7b4e1ec..cf0c8958 100644
+--- a/quic/tools/quic_toy_server.cc
++++ b/quic/tools/quic_toy_server.cc
+@@ -3,7 +3,6 @@
+ // found in the LICENSE file.
+ 
+ #include "quic/tools/quic_toy_server.h"
+-
+ #include <utility>
+ #include <vector>
+ 
+@@ -12,6 +11,7 @@
+ #include "quic/platform/api/quic_flags.h"
+ #include "quic/platform/api/quic_socket_address.h"
+ #include "quic/tools/quic_memory_cache_backend.h"
++#include "quic/core/congestion_control/pcc_utility_manager.h"
+ 
+ DEFINE_QUIC_COMMAND_LINE_FLAG(int32_t,
+                               port,
+@@ -51,6 +51,44 @@ DEFINE_QUIC_COMMAND_LINE_FLAG(bool,
+                               false,
+                               "If true, WebTransport support is enabled.");
+ 
++DEFINE_QUIC_COMMAND_LINE_FLAG(
++    std::string,
++    stream_min_bw,
++    "",
++    "Define a number which represent weighted dynamic priority for min value,"
++    "Several definitions are valid and will apply to streams according to open.");
++
++DEFINE_QUIC_COMMAND_LINE_FLAG(
++    std::string,
++    stream_max_bw,
++    "",
++    "Define a number which represent weighted dynamic priority for max value,"
++    "Several definitions are valid and will apply to streams according to open.");
++
++DEFINE_QUIC_COMMAND_LINE_FLAG(
++    std::string,
++    stream_priority,
++    "",
++    "Define if a stream has priority (single level), 0 or 1 are used."
++    "Several definitions are valid and will apply to streams according to open.");
++
++DEFINE_QUIC_COMMAND_LINE_FLAG(bool,
++                              use_default_prioritization,
++                              false,
++                              "If true, defauld SPDY 3 prioritization is used");
++
++DEFINE_QUIC_COMMAND_LINE_FLAG(
++    int32_t,
++    con_min_bw,
++    0,
++    "Define which min BW is required for QUIC connection");
++
++DEFINE_QUIC_COMMAND_LINE_FLAG(
++    int32_t,
++    con_max_bw,
++    0,
++    "Define which max BW is required for QUIC connection");
++
+ namespace quic {
+ 
+ std::unique_ptr<quic::QuicSimpleServerBackend>
+@@ -71,7 +109,7 @@ QuicToyServer::MemoryCacheBackendFactory::CreateBackend() {
+ 
+ QuicToyServer::QuicToyServer(BackendFactory* backend_factory,
+                              ServerFactory* server_factory)
+-    : backend_factory_(backend_factory), server_factory_(server_factory) {}
++    : backend_factory_(backend_factory), server_factory_(server_factory){}
+ 
+ int QuicToyServer::Start() {
+   ParsedQuicVersionVector supported_versions;
